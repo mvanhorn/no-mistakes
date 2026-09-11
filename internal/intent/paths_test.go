@@ -11,6 +11,11 @@ import (
 func newScopeRepo(t *testing.T) string {
 	t.Helper()
 	t.Setenv("GIT_CONFIG_COUNT", "0")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("NM_HOME", t.TempDir())
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	repo := t.TempDir()
 	gitTestCmd(t, repo, "init", "-b", "main")
 	gitTestCmd(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base")
