@@ -1191,3 +1191,38 @@ func TestSkillExitCodeGuidanceDistinguishesDecisionGates(t *testing.T) {
 		t.Fatal("skill should explicitly identify decision gates as normal exit 0 stops")
 	}
 }
+
+func TestRunViewFromDB_IntentProvenance(t *testing.T) {
+	for _, tt := range []struct {
+		name, source string
+		score        float64
+		present      bool
+	}{
+		{"inferred", "claude", .85, true}, {"explicit", "agent", 1, true}, {"inherited", "rerun", 1, true}, {"zero", "claude", 0, true}, {"legacy", "", 0, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &db.Run{ID: "run", Branch: "feature", Intent: strPtrCLI("private intent"), IntentSessionID: strPtrCLI("private-session")}
+			if tt.present {
+				r.IntentSource = &tt.source
+				r.IntentScore = &tt.score
+			}
+			rv := runViewFromDB(r, nil, nil)
+			out := axiDoc(runObjectField(rv))
+			if tt.present {
+				if rv.IntentSource == nil || *rv.IntentSource != tt.source || rv.IntentScore == nil || *rv.IntentScore != tt.score {
+					t.Fatalf("view lost provenance: %+v", rv)
+				}
+				for _, want := range []string{"intent_source: " + tt.source, fmt.Sprintf("intent_score: %v", tt.score)} {
+					if !strings.Contains(out, want) {
+						t.Fatalf("missing %q: %s", want, out)
+					}
+				}
+			} else if strings.Contains(out, "intent_source") || strings.Contains(out, "intent_score") {
+				t.Fatalf("legacy values invented: %s", out)
+			}
+			if strings.Contains(out, "private") {
+				t.Fatalf("intent metadata leaked: %s", out)
+			}
+		})
+	}
+}

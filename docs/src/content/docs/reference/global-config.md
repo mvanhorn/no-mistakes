@@ -710,10 +710,10 @@ Valid `disabled_readers` values are `claude`, `codex`, `opencode`, `rovodev`, `p
 The match score is the share of matching files mentioned in a transcript session; deleted files are ignored when the diff also contains non-deleted changes.
 All-deletion diffs still match against the deleted changed files.
 Mentioning extra files does not reduce the score.
-For multi-file diffs, no-mistakes still requires at least two overlapping files and an effective minimum score of `0.5`.
+For multi-file diffs, plausible contenders must overlap at least two files and cover at least `0.5` of the diff.
 Partial matches older than 24 hours are rejected unless their raw score is at least `0.8`.
-If exactly one accepted candidate has a raw score of at least `0.85`, that decisive candidate wins before recency ranking.
-Otherwise, accepted candidates are ranked by confidence, which combines the raw score with a small recency boost, with ties going to the most recent matching session, and ambiguous accepted candidates may be disambiguated by the configured pipeline agent.
+The winner must have a raw score of at least `max(intent.threshold, 0.85)` and lead the next plausible scoped session by at least `0.10`. A runner-up below the final floor still counts toward this margin; a sole strong contender needs no runner-up. Setting `intent.threshold` below `0.85` cannot weaken the safety floor. Recency and model confidence cannot increase either raw score or its lead.
+Only sessions from the authoring checkout proven to hold the run’s branch and submitted head are eligible. Weak, ambiguous, or unprovable matches require an [Intent step decision](/no-mistakes/reference/pipeline-steps/#intent).
 
 ### test.evidence
 

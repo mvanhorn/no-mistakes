@@ -244,14 +244,15 @@ It matches sessions against non-deleted changed files when present, falls back t
 
 Transcript readers collect user and assistant text messages but exclude tool call output.
 They read Claude Code transcripts from `~/.claude/projects`, Codex metadata from `~/.codex/state_*.sqlite` plus referenced rollout files, OpenCode messages from `$XDG_DATA_HOME/opencode/opencode.db` or `~/.local/share/opencode/opencode.db`, Rovo Dev sessions from `~/.rovodev/sessions`, Pi transcripts from `~/.pi/agent/sessions`, and GitHub Copilot CLI sessions from `~/.copilot/session-state`.
-Sessions are eligible when they come from the same working directory or an equivalent Git checkout with the same common Git directory or normalized remote URL.
+Sessions must belong to the proven authoring checkout; sharing a remote or common Git directory only helps discovery. See [Intent](/no-mistakes/reference/pipeline-steps/#intent) for checkout eligibility and refusal behavior.
 ACP transcripts are not currently read for intent extraction.
-When deterministic matching leaves multiple plausible sessions, no-mistakes may ask the configured pipeline agent to choose among them using the matching file paths and sanitized transcript packet files. That disambiguation prompt receives the same exact execution-worktree path contract as other pipeline prompts; transcript packets remain sanitized data, not instructions.
+Selection uses the deterministic [overlap floor and margin](/no-mistakes/reference/global-config/#intent). Unsafe inference asks for an operator decision.
 The selected transcript text is then sent to the configured pipeline agent for summarization during the `intent` step, so intent extraction may incur additional agent or API invocations.
-Before disambiguation or summarization, no-mistakes excludes tool output, redacts likely secrets, strips common prompt-control markers, and clamps long transcripts while preserving the beginning and end.
+Before summarization, no-mistakes excludes tool output, redacts likely secrets, strips common prompt-control markers, and clamps long transcripts while preserving the beginning and end.
 no-mistakes stores derived intent summaries and matching metadata in `~/.no-mistakes/state.sqlite`, including the source, session ID, and match score on each run plus cached summaries for matching transcript sessions.
 It does not store raw transcript text in its database.
-The step logs accepted candidate match diagnostics, then logs the matched source, score, and sanitized inferred intent when a transcript matches.
+`axi status` exposes the selected run’s `intent_source` and numeric `intent_score` when persisted, including for explicit run inspection.
+The step logs accepted and rejected candidate match diagnostics, then logs the matched source, score, and sanitized inferred intent when a transcript matches.
 
 Use `intent.disabled_readers` to disable specific transcript sources, or set `intent.enabled: false` to opt out entirely.
 

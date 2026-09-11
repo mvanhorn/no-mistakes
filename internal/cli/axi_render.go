@@ -111,13 +111,15 @@ type stepView struct {
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
-	ID          string
-	Branch      string
-	Status      string
-	HeadSHA     string
-	PRURL       string
-	CIReady     bool
-	CIReadyNoCI bool
+	IntentSource *string
+	IntentScore  *float64
+	ID           string
+	Branch       string
+	Status       string
+	HeadSHA      string
+	PRURL        string
+	CIReady      bool
+	CIReadyNoCI  bool
 	// AwaitingAgentSince is the unix-seconds time the run parked at a gate
 	// awaiting the driving agent, or nil when the run is not parked. It powers
 	// the top-level parked signal in the run object.
@@ -177,6 +179,8 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 
 func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	rv := runView{
+		IntentSource:       r.IntentSource,
+		IntentScore:        r.IntentScore,
 		ID:                 r.ID,
 		Branch:             r.Branch,
 		Status:             string(r.Status),
@@ -459,6 +463,12 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		{Key: "id", Value: rv.ID},
 		{Key: "branch", Value: rv.Branch},
 		{Key: "status", Value: rv.Status},
+	}
+	if rv.IntentSource != nil {
+		fields = append(fields, toon.Field{Key: "intent_source", Value: *rv.IntentSource})
+	}
+	if rv.IntentScore != nil {
+		fields = append(fields, toon.Field{Key: "intent_score", Value: *rv.IntentScore})
 	}
 	// Surface the parked-awaiting-agent signal right after status so one read
 	// distinguishes a run waiting for the agent to drive a gate from one that

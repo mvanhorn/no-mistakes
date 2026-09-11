@@ -44,14 +44,16 @@ This is best-effort context, and when available it is included in rebase fixes, 
 
 - Treats newly supplied explicit intent (`agent`) and exact inherited rerun intent (`rerun`) as authoritative acceptance criteria, while preserving their distinct sources, and skips transcript-based inference even when `intent.enabled` is false
 - Runs transcript-based inference only when `intent.enabled` is true
-- Matches local agent transcripts against non-deleted changed files when present, falling back to all changed files for all-deletion diffs, may use the configured pipeline agent to disambiguate plausible matches, and summarizes the likely author intent with that agent
+- Matches local agent transcripts against non-deleted changed files when present, falling back to all changed files for all-deletion diffs, requires the [raw overlap floor and margin](/no-mistakes/reference/global-config/#intent), and summarizes the accepted session with the configured pipeline agent
 - Stores the derived summary, source, session ID, and match score on the run
-- Logs accepted candidate diagnostics, including source, session, CWD, score, confidence, overlap, decision, and acceptance reason
+- Logs rejected scope, score, and margin decisions and accepted match diagnostics without raw transcript text
 - Logs the matched source, score, and sanitized inferred intent when a transcript matches
-- Skips instead of failing when disabled, no matching transcript is found, the diff is empty, extraction errors, or persistence fails
+- Parks with an `ask-user` warning when checkout ownership is unprovable or discovered transcripts are out of scope, weak, or ambiguous; no rejected summary or provenance is cached or attached
+- Skips when disabled, transcripts are absent, the diff is empty, ordinary extraction errors occur, or persistence fails
 
 This step does not block the pipeline for missing transcripts, summarization that exceeds the five-minute extraction cap, or other extraction failures, which are reported as skipped outcomes.
-It can fail the run only if cleanup fails after the disambiguation agent leaves worktree side effects.
+Unsafe inference requires an operator decision before review. Approval continues without inferred intent and never promotes the refused candidate; supply explicit intent on a new run to replace uncertain inference.
+The authoring checkout must be the sole non-bare local worktree on the run’s branch, with its live HEAD equal to the submitted head (or the run head for legacy rows). A moved head, detached or missing checkout, sibling worktree, nested repository, or same-remote clone cannot supply that proof.
 
 ## Rebase
 

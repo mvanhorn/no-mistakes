@@ -22,8 +22,7 @@ type Result struct {
 type ExtractParams struct {
 	// HomeDir overrides the user's home directory. Empty means use os.UserHomeDir.
 	HomeDir string
-	// OriginCWD is the user's actual repo directory. The caller is responsible
-	// for passing the original working path, NOT the no-mistakes worktree.
+	// OriginCWD is the authoring checkout proven by ResolveAuthoringCheckout.
 	OriginCWD string
 	// DiffFiles is the repo-relative file set used for matching and scoring.
 	DiffFiles []string
@@ -33,22 +32,15 @@ type ExtractParams struct {
 	HeadTime time.Time
 	// SlackDays extends WindowStart backwards. The plan called for 3 days.
 	SlackDays int
-	// Threshold is the minimum raw file-overlap score required before applying
-	// stricter multi-file and stale-partial acceptance rules.
+	// Threshold may raise, but never lower, the raw overlap safety floor.
 	Threshold float64
-	// Readers are the per-agent transcript readers to consult. Order is
-	// insignificant; matching accepts plausible candidates, prefers a single
-	// decisive raw-score match, and otherwise ranks by confidence or an optional
-	// Disambiguator.
+	// Readers discover metadata; Extract enforces checkout eligibility centrally.
 	Readers []Reader
 	// Cache is consulted before summarization. Pass NewMemCache() if no DB.
 	Cache Cache
 	// Summarizer turns the chosen session's text into a short summary.
 	Summarizer Summarizer
-	// Disambiguator optionally chooses among multiple plausible sessions when
-	// file-overlap scoring is not decisive enough to pick one safely.
-	Disambiguator Disambiguator
-	// Logf receives best-effort accepted candidate diagnostics. Nil disables logging.
+	// Logf receives scope and match diagnostics, without transcript text.
 	Logf func(format string, args ...any)
 }
 
@@ -56,15 +48,14 @@ type ExtractParams struct {
 // should treat this as a normal "no intent attached" outcome, not an error.
 var ErrNoMatch = errors.New("intent: no matching transcript")
 
-// Extract runs the discover -> match -> optional disambiguate -> cache ->
-// summarize pipeline and returns the final intent. It returns ErrNoMatch when
-// no session satisfies the matcher's threshold, overlap, and freshness
-// acceptance rules. Disambiguation failures fall back to the deterministic
-// match, except cleanup failures are returned because worktree side effects
-// may remain.
+// ErrUnsafeMatch indicates that discovered evidence cannot safely identify the
+// authoring session. Callers must ask the operator before continuing.
+var ErrUnsafeMatch = errors.New("intent: unsafe transcript match")
+
+// Extract validates scope and raw overlap before consulting the summary cache.
 func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 	if p.OriginCWD == "" {
-		return nil, fmt.Errorf("intent: OriginCWD is required")
+		return nil, fmt.Errorf("%w: authoring checkout is required", ErrUnsafeMatch)
 	}
 	if len(p.DiffFiles) == 0 {
 		return nil, ErrNoMatch
@@ -85,6 +76,8 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 	}
 
 	var sessions []*Session
+	rejectedScope := false
+	originRoot := checkoutRoot(ctx, p.OriginCWD)
 	for _, r := range p.Readers {
 		if r == nil {
 			continue
@@ -95,19 +88,29 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 			continue
 		}
 		for _, s := range discovered {
+			if s == nil {
+				continue
+			}
 			s.AgentName = r.Name()
+			if originRoot == "" || checkoutRoot(ctx, s.CWD) != originRoot {
+				rejectedScope = true
+				if p.Logf != nil {
+					p.Logf("decision=rejected_scope agent=%s session=%s", s.AgentName, s.SessionID)
+				}
+				continue
+			}
+			sessions = append(sessions, s)
 		}
-		sessions = append(sessions, discovered...)
 	}
 
 	if len(sessions) == 0 {
+		if rejectedScope {
+			return nil, fmt.Errorf("%w: discovered transcripts do not belong to the authoring checkout", ErrUnsafeMatch)
+		}
 		return nil, ErrNoMatch
 	}
 
-	// Load message bodies only for sessions that look promising on metadata.
-	// At this stage we cannot score yet (need messages), so we load them all.
-	// Discover is supposed to keep the candidate set small via the time/cwd
-	// filter; if that's true, this is cheap.
+	// Load bodies only after every reader has passed the same checkout check.
 	var loaded []*Session
 	for _, s := range sessions {
 		var reader Reader
@@ -127,15 +130,14 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		loaded = append(loaded, s)
 	}
 
-	match := pickMatchWithOptions(loaded, p.DiffFiles, matchOptions{
+	if len(loaded) == 0 && !rejectedScope {
+		return nil, ErrNoMatch
+	}
+	match, err := selectMatch(loaded, p.DiffFiles, matchOptions{
 		Threshold: p.Threshold,
 		HeadTime:  p.HeadTime,
 		Logf:      p.Logf,
 	})
-	if match == nil {
-		return nil, ErrNoMatch
-	}
-	match, err := disambiguateMatch(ctx, p, match, loaded)
 	if err != nil {
 		return nil, err
 	}
@@ -162,38 +164,6 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		SessionID: match.Session.SessionID,
 		Score:     match.Score,
 	}, nil
-}
-
-func disambiguateMatch(ctx context.Context, p ExtractParams, fallback *Match, loaded []*Session) (*Match, error) {
-	if p.Disambiguator == nil {
-		return fallback, nil
-	}
-	candidates := acceptedMatches(loaded, p.DiffFiles, matchOptions{
-		Threshold: p.Threshold,
-		HeadTime:  p.HeadTime,
-	})
-	if !shouldDisambiguate(candidates) {
-		return fallback, nil
-	}
-	choice, err := p.Disambiguator.Disambiguate(ctx, p.DiffFiles, candidates)
-	if err != nil {
-		if errors.Is(err, ErrDisambiguatorCleanup) {
-			return nil, fmt.Errorf("intent: disambiguator cleanup: %w", err)
-		}
-		if p.Logf != nil {
-			p.Logf("disambiguator failed: %v", err)
-		}
-		return fallback, nil
-	}
-	for _, candidate := range candidates {
-		if candidate.Session != nil && candidate.Session.AgentName == choice.AgentName && candidate.Session.SessionID == choice.SessionID {
-			return candidate, nil
-		}
-	}
-	if p.Logf != nil {
-		p.Logf("disambiguator returned unknown session %q/%q", choice.AgentName, choice.SessionID)
-	}
-	return fallback, nil
 }
 
 func maxInt(a, b int) int {

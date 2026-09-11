@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	toon "github.com/toon-format/toon-go"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -557,4 +558,59 @@ func TestAxiDetachedHEADHelpOffersOnlyValidActions(t *testing.T) {
 			t.Fatalf("detached logs suggested starting a run:\n%s", got)
 		}
 	})
+}
+
+func TestAxiStatus_IntentProvenanceFollowsSelectedRun(t *testing.T) {
+	repoDir, _, database, repo := setupAxiQueryRepo(t)
+	run(t, repoDir, "git", "checkout", "-b", "feature/mine")
+	chdir(t, repoDir)
+	mine, err := database.InsertRun(repo.ID, "feature/mine", "mine-head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := database.InsertRun(repo.ID, "feature/other", "other-head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []struct {
+		id, source string
+		score      float64
+	}{{mine.ID, "claude", .85}, {other.ID, "rerun", 1}} {
+		if err := database.UpdateRunIntent(r.id, db.RunIntent{Summary: "private text", SessionID: "private-session", Source: r.source, Score: r.score}); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.UpdateRunStatus(r.id, types.RunRunning); err != nil {
+			t.Fatal(err)
+		}
+		step, err := database.InsertStepResult(r.id, types.StepIntent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.UpdateStepStatus(step.ID, types.StepStatusAwaitingApproval); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range []struct{ id, key, source, score, absent string }{{"", "run", "claude", "0.85", "rerun"}, {other.ID, "other_branch_run", "rerun", "1", "claude"}} {
+		out := axiStatusOutput(t, tt.id)
+		doc := decodeStatusDoc(t, out)
+		if tt.id == "" && doc.Run.ID != mine.ID {
+			t.Fatalf("wrong current run: %s", out)
+		}
+		if tt.id != "" && (doc.OtherBranchRun.ID != other.ID || doc.Run.ID != "") {
+			t.Fatalf("wrong foreign run: %s", out)
+		}
+		for _, want := range []string{tt.key + ":", "intent_source: " + tt.source, "intent_score: " + tt.score} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("missing %q: %s", want, out)
+			}
+		}
+		for _, bad := range []string{"intent_source: " + tt.absent, "private text", "private-session"} {
+			if strings.Contains(out, bad) {
+				t.Fatalf("leaked %q: %s", bad, out)
+			}
+		}
+		if tt.id != "" && (!strings.Contains(out, "inspection-only") || strings.Contains(out, "axi respond")) {
+			t.Fatalf("foreign guidance changed: %s", out)
+		}
+	}
 }

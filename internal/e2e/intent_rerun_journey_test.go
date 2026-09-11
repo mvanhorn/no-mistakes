@@ -3,6 +3,8 @@
 package e2e
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,9 +47,9 @@ func TestRerunIntentProvenanceJourney(t *testing.T) {
 	assertCompletedRerunFixture(t, h, overriddenExplicit, "replace the canonical requirements explicitly", "agent")
 
 	inferredBranch := "feature/rerun-inferred"
-	seedClaudeTranscript(t, h.HomeDir, h.WorkDir, "inferred.txt")
 	h.CommitChange(inferredBranch, "inferred.txt", "inferred\n", "add inferred fixture")
 	inferredWT := h.AddWorktree(inferredBranch)
+	seedClaudeTranscript(t, h.HomeDir, inferredWT, "inferred.txt")
 	h.PushToGate(inferredBranch)
 	originalInferred := h.WaitForRun(inferredBranch, 90*time.Second)
 	assertCompletedRerunFixture(t, h, originalInferred, "user wanted Bar() helper added", "claude")
@@ -61,6 +63,43 @@ func TestRerunIntentProvenanceJourney(t *testing.T) {
 	if log := readStepLog(t, h, fresh.ID, "intent"); !strings.Contains(log, "scanning recent agent transcripts") {
 		t.Errorf("non-explicit rerun should perform fresh inference, log:\n%s", log)
 	}
+
+	// The original inferred summary must not be inherited when current evidence
+	// is ambiguous, even when it is already cached from the earlier run.
+	fixtureDir := filepath.Join(h.HomeDir, ".claude", "projects", testClaudeProjectDirName(inferredWT))
+	raw, err := os.ReadFile(filepath.Join(fixtureDir, "e2e-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	competitor := strings.ReplaceAll(string(raw), "e2e-session", "competing-session")
+	if err := os.WriteFile(filepath.Join(fixtureDir, "competing-session.jsonl"), []byte(competitor), 0644); err != nil {
+		t.Fatal(err)
+	}
+	before := len(h.AgentInvocations())
+	if out, err := h.RunInDir(inferredWT, "rerun"); err != nil {
+		t.Fatalf("ambiguous rerun: %v\n%s", err, out)
+	}
+	parked := waitForStepStatus(t, h, inferredBranch, types.StepIntent, types.StepStatusAwaitingApproval, 60*time.Second)
+	assertNoInferredIntent(t, h, parked.ID)
+	step, ok := findStep(parked.Steps, types.StepIntent)
+	if !ok || step.FindingsJSON == nil {
+		t.Fatal("missing parked intent findings")
+	}
+	findings, err := types.ParseFindingsJSON(*step.FindingsJSON)
+	if err != nil || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser {
+		t.Fatalf("findings %+v: %v", findings, err)
+	}
+	for _, inv := range h.AgentInvocations()[before:] {
+		if strings.Contains(inv.Prompt, "Review the code changes") || strings.Contains(inv.Prompt, "transcript of a developer's recent conversation") {
+			t.Fatal("unsafe rerun reached an agent before a decision")
+		}
+	}
+	h.Respond(parked.ID, types.StepIntent, types.ActionApprove)
+	completed := h.WaitForRun(inferredBranch, 90*time.Second)
+	if completed.Status != types.RunCompleted {
+		t.Fatalf("approved rerun: %s", completed.Status)
+	}
+	assertNoInferredIntent(t, h, completed.ID)
 
 	overriddenInferred := runCLIAndWait(t, h, inferredWT, inferredBranch, "rerun", "--intent", "override inferred intent")
 	assertCompletedRerunFixture(t, h, overriddenInferred, "override inferred intent", "agent")
@@ -96,4 +135,24 @@ func assertCompletedRerunFixture(t *testing.T, h *Harness, run *ipc.RunInfo, wan
 		t.Fatalf("run %s intent_source=%v, want %q", run.ID, intent.source, wantSource)
 	}
 	t.Logf("persisted run %s: intent_source=%q intent=%q", run.ID, *intent.source, *intent.summary)
+}
+
+func TestRerunIntentDisabledJourney(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: writeIntentScenario(t), GlobalConfigExtra: "intent:\n  enabled: false"})
+	if out, err := h.Run("init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	branch := "feature/disabled-intent"
+	h.CommitChange(branch, "explicit.txt", "explicit\n", "explicit intent")
+	author := h.AddWorktree(branch)
+	h.PushToGate(branch)
+	h.WaitForRun(branch, 90*time.Second)
+	explicit := "all requirements\nincluding exclusions\nwithout condensation"
+	first := runCLIAndWait(t, h, author, branch, "rerun", "--intent", explicit)
+	assertCompletedRerunFixture(t, h, first, explicit, "agent")
+	inherited := runCLIAndWait(t, h, author, branch, "rerun")
+	assertCompletedRerunFixture(t, h, inherited, explicit, "rerun")
+	if anyInvocationContains(h.AgentInvocations(), "transcript of a developer's recent conversation") {
+		t.Fatal("disabled inference invoked summarizer")
+	}
 }

@@ -9,7 +9,7 @@ import (
 )
 
 func TestExtract_EndToEndWithClaudeFixture(t *testing.T) {
-	repoCWD := t.TempDir()
+	repoCWD := newScopeRepo(t)
 	home := writeClaudeFixture(t, repoCWD, []string{
 		`{"type":"user","cwd":` + jsonString(t, repoCWD) + `,"timestamp":"2026-04-18T02:15:37.407Z","uuid":"u1","sessionId":"s1","message":{"role":"user","content":"please rewrite internal/foo.go to add a Bar() function"}}`,
 		`{"type":"assistant","cwd":` + jsonString(t, repoCWD) + `,"timestamp":"2026-04-18T02:15:38.000Z","uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + jsonString(t, filepath.Join(repoCWD, "internal", "foo.go")) + `}}]}}`,
@@ -41,7 +41,7 @@ func TestExtract_EndToEndWithClaudeFixture(t *testing.T) {
 }
 
 func TestExtract_EndToEndWithPiFixture(t *testing.T) {
-	repoCWD := t.TempDir()
+	repoCWD := newScopeRepo(t)
 	home := writePiFixture(t, repoCWD)
 
 	fa := &fakeAgent{output: `{"summary": "user wanted foo helper changes in internal/foo.go"}`}

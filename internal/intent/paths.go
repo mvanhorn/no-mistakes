@@ -2,6 +2,7 @@ package intent
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
@@ -43,6 +44,8 @@ func pathsEqual(a, b string) bool {
 	return canonicalPath(a) == canonicalPath(b)
 }
 
+// repoMatcher provides broad discovery hints only. Shared Git storage or a
+// remote URL never proves that a transcript belongs to the authoring checkout.
 type repoMatcher struct {
 	origin string
 	ids    map[string]repoIdentity
@@ -158,4 +161,90 @@ func firstLine(s string) string {
 		return strings.TrimSpace(s[:i])
 	}
 	return strings.TrimSpace(s)
+}
+
+// checkoutRoot requires a live non-bare Git checkout. Subdirectories and
+// symlink aliases resolve to its canonical root; nested repositories do not.
+func checkoutRoot(ctx context.Context, dir string) string {
+	if dir == "" {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	root := gitOutput(ctx, resolved, "rev-parse", "--show-toplevel")
+	if root == "" {
+		return ""
+	}
+	resolved, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return ""
+	}
+	return canonicalPath(resolved)
+}
+
+// ResolveAuthoringCheckout binds transcript scope to the sole local checkout
+// holding the submitted branch and head. Gate worktrees and same-remote clones
+// cannot substitute for that proof. This function performs no Git mutations.
+func ResolveAuthoringCheckout(ctx context.Context, workingPath, branch, submittedHead string) (string, error) {
+	unsafe := func(reason string) (string, error) { return "", fmt.Errorf("%w: %s", ErrUnsafeMatch, reason) }
+	if workingPath == "" || branch == "" || submittedHead == "" {
+		return unsafe("missing authoring branch or submitted head")
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", workingPath, "worktree", "list", "--porcelain", "-z")
+	winproc.Harden(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return unsafe("cannot read local Git worktree metadata")
+	}
+	var selected string
+	matches := 0
+	for _, record := range strings.Split(string(out), "\x00\x00") {
+		var path, ref string
+		bare, prunable := false, false
+		for _, field := range strings.Split(record, "\x00") {
+			switch {
+			case strings.HasPrefix(field, "worktree "):
+				path = strings.TrimPrefix(field, "worktree ")
+			case strings.HasPrefix(field, "branch "):
+				ref = strings.TrimPrefix(field, "branch ")
+			case field == "bare":
+				bare = true
+			case field == "prunable" || strings.HasPrefix(field, "prunable "):
+				prunable = true
+			}
+		}
+		if !bare && ref == "refs/heads/"+branch {
+			matches++
+			if prunable {
+				return unsafe("authoring checkout is prunable")
+			}
+			selected = path
+		}
+	}
+	if matches != 1 {
+		return unsafe(fmt.Sprintf("expected one authoring checkout for branch %q; found %d", branch, matches))
+	}
+	root := checkoutRoot(ctx, selected)
+	if root == "" || root != canonicalPath(selected) {
+		return unsafe("authoring checkout is missing or unresolvable")
+	}
+	// Re-read live identity rather than trusting potentially stale worktree rows.
+	if gitOutput(ctx, root, "symbolic-ref", "-q", "HEAD") != "refs/heads/"+branch {
+		return unsafe("authoring checkout is detached or changed branch")
+	}
+	if gitOutput(ctx, root, "rev-parse", "HEAD") != submittedHead {
+		return unsafe("authoring checkout HEAD differs from the submitted head")
+	}
+	registered := gitRepoIdentity(ctx, workingPath)
+	actual := gitRepoIdentity(ctx, root)
+	if registered.commonDir == "" || actual.commonDir != registered.commonDir {
+		return unsafe("authoring checkout no longer belongs to the registered Git repository")
+	}
+	return root, nil
 }

@@ -1,21 +1,22 @@
 package intent
 
 import (
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 )
 
-const decisiveMatchScore = 0.85
+const (
+	decisiveMatchScore = 0.85
+	minimumMatchMargin = 0.10
+)
 
 // Match is the chosen session along with its overlap score.
 type Match struct {
 	Session *Session
 	Score   float64
-	// Confidence is the score used to rank accepted candidates after applying
-	// recency. Score remains the raw file-overlap score surfaced to callers.
-	Confidence float64
 	// Overlap lists diff files that appeared in this session. Used purely
 	// for diagnostics/telemetry.
 	Overlap []string
@@ -73,111 +74,73 @@ func pathMentionMatchesDiff(mention, diffFile string) bool {
 	return !strings.Contains(mention, "/") && filepath.Base(diffFile) == mention
 }
 
-// pickMatch returns the deterministic winner among accepted sessions.
-// A single decisive raw-score candidate wins before confidence ranking.
-// Otherwise, accepted candidates are ranked by confidence, with ties broken by
-// LastActivity.
+// pickMatch is the convenience wrapper for callers that only need a winner.
 func pickMatch(sessions []*Session, diffFiles []string, threshold float64) *Match {
 	return pickMatchWithOptions(sessions, diffFiles, matchOptions{Threshold: threshold})
 }
 
 func pickMatchWithOptions(sessions []*Session, diffFiles []string, opts matchOptions) *Match {
-	candidates := acceptedMatches(sessions, diffFiles, opts)
-	if len(candidates) == 0 {
-		return nil
-	}
-	return deterministicMatch(candidates)
+	match, _ := selectMatch(sessions, diffFiles, opts)
+	return match
 }
 
-func acceptedMatches(sessions []*Session, diffFiles []string, opts matchOptions) []*Match {
+// selectMatch compares plausible contenders before applying the final floor.
+// A runner-up below that floor still makes a close selection unsafe.
+func selectMatch(sessions []*Session, diffFiles []string, opts matchOptions) (*Match, error) {
 	var candidates []*Match
+	seen := make(map[[2]string]bool)
 	for _, s := range sessions {
-		sc, overlap := score(s, diffFiles)
-		accepted, reason, confidence := acceptMatchCandidate(sc, len(overlap), len(diffFiles), s.LastActivity, opts)
-		if !accepted {
+		key := [2]string{s.AgentName, s.SessionID}
+		if s.SessionID != "" && seen[key] {
 			continue
+		}
+		seen[key] = true
+		sc, overlap := score(s, diffFiles)
+		reason := "plausible"
+		switch {
+		case len(overlap) == 0:
+			reason = "no_overlap"
+		case len(diffFiles) > 1 && len(overlap) < 2:
+			reason = "single_overlap_multi_file_diff"
+		case len(diffFiles) > 1 && sc < 0.5:
+			reason = "below_plausible_overlap"
+		case !opts.HeadTime.IsZero() && s.LastActivity.Before(opts.HeadTime.Add(-24*time.Hour)) && sc < 0.8:
+			reason = "stale_partial"
 		}
 		if opts.Logf != nil {
-			opts.Logf("candidate agent=%s session=%s cwd=%q score %.2f confidence %.2f overlap=%d/%d decision=accepted reason=%s",
-				s.AgentName, s.SessionID, s.CWD, sc, confidence, len(overlap), len(diffFiles), reason)
+			opts.Logf("candidate agent=%s session=%s score %.2f overlap=%d/%d decision=%s", s.AgentName, s.SessionID, sc, len(overlap), len(diffFiles), reason)
 		}
-		candidates = append(candidates, &Match{Session: s, Score: sc, Confidence: confidence, Overlap: overlap})
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].Confidence == candidates[j].Confidence {
-			return candidates[i].Session.LastActivity.After(candidates[j].Session.LastActivity)
-		}
-		return candidates[i].Confidence > candidates[j].Confidence
-	})
-	return candidates
-}
-
-func shouldDisambiguate(candidates []*Match) bool {
-	if len(candidates) < 2 {
-		return false
-	}
-	decisive := 0
-	for _, candidate := range candidates {
-		if candidate.Score >= decisiveMatchScore {
-			decisive++
+		if reason == "plausible" {
+			candidates = append(candidates, &Match{Session: s, Score: sc, Overlap: overlap})
 		}
 	}
-	return decisive != 1
-}
-
-func deterministicMatch(candidates []*Match) *Match {
-	var singleDecisive *Match
-	for _, candidate := range candidates {
-		if candidate.Score < decisiveMatchScore {
-			continue
+	refuse := func(reason string) (*Match, error) {
+		if opts.Logf != nil {
+			opts.Logf("decision=rejected %s", reason)
 		}
-		if singleDecisive != nil {
-			return candidates[0]
-		}
-		singleDecisive = candidate
+		return nil, fmt.Errorf("%w: %s", ErrUnsafeMatch, reason)
 	}
-	if singleDecisive != nil {
-		return singleDecisive
+	if len(candidates) == 0 {
+		return refuse("no scoped transcript has sufficient overlap and freshness")
 	}
-	return candidates[0]
-}
-
-func acceptMatchCandidate(score float64, overlapCount, diffCount int, lastActivity time.Time, opts matchOptions) (bool, string, float64) {
-	if diffCount == 0 || overlapCount == 0 {
-		return false, "no_overlap", score
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Score > candidates[j].Score })
+	winner := candidates[0]
+	floor := decisiveMatchScore
+	if opts.Threshold > floor {
+		floor = opts.Threshold
 	}
-	threshold := opts.Threshold
-	if diffCount > 1 && threshold < 0.5 {
-		threshold = 0.5
+	if winner.Score < floor {
+		return refuse(fmt.Sprintf("raw overlap %.2f is below required %.2f", winner.Score, floor))
 	}
-	if diffCount > 1 && overlapCount < 2 {
-		return false, "single_overlap_multi_file_diff", score
+	// Both scores share the diff-file denominator. Subtract overlap counts
+	// first to avoid floating-point subtraction at the exact 0.10 boundary.
+	if len(candidates) > 1 && float64(len(winner.Overlap)-len(candidates[1].Overlap))/float64(len(diffFiles)) < minimumMatchMargin {
+		return refuse(fmt.Sprintf("ambiguous raw overlap %.2f versus %.2f; required lead %.2f", winner.Score, candidates[1].Score, minimumMatchMargin))
 	}
-	if score < threshold {
-		return false, "below_threshold", score
+	if opts.Logf != nil {
+		opts.Logf("decision=accepted agent=%s session=%s score %.2f", winner.Session.AgentName, winner.Session.SessionID, winner.Score)
 	}
-	confidence := score + recencyBoost(opts.HeadTime, lastActivity)
-	if !opts.HeadTime.IsZero() && lastActivity.Before(opts.HeadTime.Add(-24*time.Hour)) && score < 0.8 {
-		return false, "stale_partial", confidence
-	}
-	return true, "matched", confidence
-}
-
-func recencyBoost(headTime, lastActivity time.Time) float64 {
-	if headTime.IsZero() || lastActivity.IsZero() {
-		return 0
-	}
-	age := headTime.Sub(lastActivity)
-	if age < 0 {
-		age = -age
-	}
-	if age <= 2*time.Hour {
-		return 0.15
-	}
-	if age <= 24*time.Hour {
-		return 0.05
-	}
-	return 0
+	return winner, nil
 }
 
 // normalizedPathVariants returns a small set of normalized forms for a

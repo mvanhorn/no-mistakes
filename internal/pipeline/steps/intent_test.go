@@ -3,7 +3,6 @@ package steps
 import (
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -257,26 +256,6 @@ func TestIntentStep_SlowExtractionPastOldTimeoutStillAttachesIntent(t *testing.T
 	}
 }
 
-func TestIntentStep_DisambiguatorCleanupErrorReturnsError(t *testing.T) {
-	sctx := newIntentStepContext(t)
-	step := &IntentStep{
-		runIntent: func(_ context.Context, _ *pipeline.StepContext) (*intent.Result, error) {
-			return nil, fmt.Errorf("restore worktree: %w", intent.ErrDisambiguatorCleanup)
-		},
-	}
-
-	outcome, err := step.Execute(sctx)
-	if !errors.Is(err, intent.ErrDisambiguatorCleanup) {
-		t.Fatalf("execute error = %v, want ErrDisambiguatorCleanup", err)
-	}
-	if outcome != nil {
-		t.Errorf("outcome = %+v, want nil", outcome)
-	}
-	if sctx.Run.Intent != nil {
-		t.Errorf("run.Intent should remain nil on cleanup error, got %q", *sctx.Run.Intent)
-	}
-}
-
 func TestIntentStep_DisabledByConfigSkipsExtractor(t *testing.T) {
 	sctx := newIntentStepContext(t)
 	sctx.Config.Intent.Enabled = false
@@ -354,5 +333,39 @@ func TestIntentStep_UsesSuppliedIntent(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("missing supplied-intent log line; logs: %v", logs)
+	}
+}
+
+func TestIntentStep_UnsafeMatchAsksUserWithoutAttachingIntent(t *testing.T) {
+	sctx := newIntentStepContext(t)
+	step := &IntentStep{runIntent: func(context.Context, *pipeline.StepContext) (*intent.Result, error) {
+		return nil, intent.ErrUnsafeMatch
+	}}
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnsafeIntentOutcome(t, sctx, outcome)
+}
+
+func TestIntentStep_AuthoritativeIntentSurvivesDisabledInference(t *testing.T) {
+	for _, source := range []string{"agent", "rerun"} {
+		t.Run(source, func(t *testing.T) {
+			sctx := newIntentStepContext(t)
+			sctx.Config.Intent.Enabled = false
+			supplied := "  complete requirements\nincluding exclusions\n\tverbatim  "
+			score := 1.0
+			sctx.Run.Intent = &supplied
+			sctx.Run.IntentSource = &source
+			sctx.Run.IntentScore = &score
+			step := &IntentStep{runIntent: func(context.Context, *pipeline.StepContext) (*intent.Result, error) {
+				t.Fatal("authoritative intent reached inference")
+				return nil, nil
+			}}
+			out, err := step.Execute(sctx)
+			if err != nil || out.Skipped || out.NeedsApproval || *sctx.Run.Intent != supplied || *sctx.Run.IntentSource != source || *sctx.Run.IntentScore != 1 {
+				t.Fatalf("out=%+v err=%v run=%+v", out, err, sctx.Run)
+			}
+		})
 	}
 }

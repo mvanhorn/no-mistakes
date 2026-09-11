@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,13 +21,8 @@ import (
 // intentExtractTimeout caps total wall-clock time spent on intent extraction.
 const intentExtractTimeout = 300 * time.Second
 
-// IntentStep is a best-effort pipeline step that infers the user's intent
-// from local agent transcripts and attaches it to the run so downstream
-// steps can surface it in their prompts. Failures are intentionally
-// swallowed and surface as a "skipped" outcome rather than a run failure:
-// missing transcripts, slow summarizers, or DB hiccups must not block
-// the pipeline. Disambiguator cleanup failures are fatal because they may leave
-// worktree side effects that could affect later steps.
+// IntentStep attaches safely inferred intent. Ordinary extraction failures skip;
+// unsafe authorship evidence asks the operator before downstream review.
 type IntentStep struct {
 	// runIntent computes the intent for a step context. It is overridden
 	// in tests; the zero value falls back to defaultRunIntent which wires
@@ -111,10 +107,15 @@ func (s *IntentStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.Step
 			sctx.Log("no diff between base and head, skipping intent extraction")
 			return &pipeline.StepOutcome{Skipped: true}, nil
 		}
-		if errors.Is(runErr, intent.ErrDisambiguatorCleanup) {
-			outcomeLabel = "error"
-			sctx.Log(fmt.Sprintf("intent extraction failed: %v", runErr))
-			return nil, runErr
+		if errors.Is(runErr, intent.ErrUnsafeMatch) {
+			outcomeLabel = "unsafe_match"
+			reason := runErr.Error()
+			sctx.Log(reason)
+			findings, _ := json.Marshal(Findings{Items: []Finding{{
+				Severity: "warning", Action: types.ActionAskUser,
+				Description: reason + ". Supply explicit intent on a new run, or approve continuing without inferred intent.",
+			}}, Summary: "Transcript intent requires an operator decision"})
+			return &pipeline.StepOutcome{NeedsApproval: true, Findings: string(findings)}, nil
 		}
 		slog.Debug("intent: extract failed", "run_id", sctx.Run.ID, "error", runErr)
 		outcomeLabel = "error"
@@ -207,17 +208,25 @@ func defaultRunIntent(ctx context.Context, sctx *pipeline.StepContext) (*intent.
 		}
 	}
 
+	submittedHead := run.HeadSHA
+	if run.SubmittedHeadSHA != nil && *run.SubmittedHeadSHA != "" {
+		submittedHead = *run.SubmittedHeadSHA
+	}
+	originCWD, err := intent.ResolveAuthoringCheckout(ctx, repo.WorkingPath, run.Branch, submittedHead)
+	if err != nil {
+		return nil, err
+	}
+
 	return intent.Extract(ctx, intent.ExtractParams{
-		OriginCWD:     repo.WorkingPath,
-		DiffFiles:     diffFiles,
-		BaseTime:      baseTime,
-		HeadTime:      headTime,
-		SlackDays:     cfg.Intent.SlackDays,
-		Threshold:     cfg.Intent.Threshold,
-		Readers:       intent.AllReaders(cfg.Intent.DisabledReaders),
-		Cache:         intent.NewDBCache(sctx.DB),
-		Summarizer:    intent.NewAgentSummarizer(sctx.Agent, gitWorkDir),
-		Disambiguator: intent.NewAgentDisambiguator(sctx.Agent, gitWorkDir),
+		OriginCWD:  originCWD,
+		DiffFiles:  diffFiles,
+		BaseTime:   baseTime,
+		HeadTime:   headTime,
+		SlackDays:  cfg.Intent.SlackDays,
+		Threshold:  cfg.Intent.Threshold,
+		Readers:    intent.AllReaders(cfg.Intent.DisabledReaders),
+		Cache:      intent.NewDBCache(sctx.DB),
+		Summarizer: intent.NewAgentSummarizer(sctx.Agent, gitWorkDir),
 		Logf: func(format string, args ...any) {
 			sctx.Log(fmt.Sprintf("intent "+format, args...))
 		},

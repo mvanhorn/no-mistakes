@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -298,4 +299,68 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func TestUnsafeIntentJourney_ParksAcrossRestartUntilOperatorDecision(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: writeIntentScenario(t)})
+	if out, err := h.Run("init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	branch := "feature/unsafe-intent"
+	h.CommitChange(branch, "intent-target.txt", "feature\n", "add target")
+	author := h.AddWorktree(branch)
+	// Only the registered main checkout has a transcript. Shared Git storage
+	// makes it discoverable, but it is not this branch's authoring checkout.
+	seedClaudeTranscript(t, h.HomeDir, h.WorkDir, "intent-target.txt")
+	h.PushToGate(branch)
+	parked := waitForStepStatus(t, h, branch, types.StepIntent, types.StepStatusAwaitingApproval, 60*time.Second)
+	assertUnsafeIntentParked(t, h, parked)
+	assertDaemonRestartWhileRunning(t, h)
+	recovered := waitForStepStatus(t, h, branch, types.StepIntent, types.StepStatusAwaitingApproval, 60*time.Second)
+	if recovered.ID != parked.ID {
+		t.Fatalf("recovery changed run %s to %s", parked.ID, recovered.ID)
+	}
+	assertUnsafeIntentParked(t, h, recovered)
+	out, err := h.RunInDir(author, "axi", "respond", "--action", "approve")
+	if err != nil {
+		t.Fatalf("approve: %v\n%s", err, out)
+	}
+	done := h.WaitForRun(branch, 90*time.Second)
+	if done.Status != types.RunCompleted {
+		t.Fatalf("approved run status %s", done.Status)
+	}
+	assertNoInferredIntent(t, h, done.ID)
+	review := findInvocationContaining(h.AgentInvocations(), "Review the code changes and return structured findings")
+	if review == "" || strings.Contains(review, "User intent (inferred") {
+		t.Fatalf("approved review missing or attached refused intent: %s", review)
+	}
+}
+
+func assertNoInferredIntent(t *testing.T, h *Harness, runID string) {
+	t.Helper()
+	got := readRunIntent(t, h.NMHome, runID)
+	if got.summary != nil || got.source != nil || got.sessionID != nil || got.score != nil {
+		t.Fatalf("refused inference persisted: %+v", got)
+	}
+}
+
+func assertUnsafeIntentParked(t *testing.T, h *Harness, run *ipc.RunInfo) {
+	t.Helper()
+	if run == nil {
+		t.Fatal("run did not park")
+	}
+	step, ok := findStep(run.Steps, types.StepIntent)
+	if !ok || step.FindingsJSON == nil {
+		t.Fatal("missing persisted intent finding")
+	}
+	findings, err := types.ParseFindingsJSON(*step.FindingsJSON)
+	if err != nil || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser || findings.Items[0].Severity != "warning" {
+		t.Fatalf("intent findings %+v: %v", findings, err)
+	}
+	assertNoInferredIntent(t, h, run.ID)
+	for _, needle := range []string{"Review the code changes and return structured findings", "transcript of a developer's recent conversation"} {
+		if anyInvocationContains(h.AgentInvocations(), needle) {
+			t.Fatalf("unsafe inference invoked %q before a decision", needle)
+		}
+	}
 }

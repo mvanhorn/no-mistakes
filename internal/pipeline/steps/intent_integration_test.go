@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 // fakeIntentAgent always returns a canned summary - bypasses any real LLM.
@@ -103,7 +104,7 @@ func newIntentIntegrationContext(t *testing.T, repoDir, base, head string, cfg *
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := d.InsertRun(repo.ID, "feature", head, base)
+	run, err := d.InsertRun(repo.ID, gitCmd(t, repoDir, "branch", "--show-current"), head, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,6 +336,7 @@ func TestIntentStep_Integration_UsesPipelineWorkDirForGitState(t *testing.T) {
 	cfg := &config.Config{Intent: config.Intent{Enabled: true, Threshold: 0.1, SlackDays: 3}}
 	sctx := newIntentIntegrationContext(t, originRepo, base, head, cfg)
 	sctx.WorkDir = pipelineWorkDir
+	sctx.Run.SubmittedHeadSHA = &base
 
 	outcome, err := (&IntentStep{}).Execute(sctx)
 	if err != nil {
@@ -417,5 +419,145 @@ func TestIntentStep_Integration_RespectsTimeout(t *testing.T) {
 	case <-done:
 	case <-time.After(intentExtractTimeout + 5*time.Second):
 		t.Fatal("IntentStep.Execute did not return within budget")
+	}
+}
+
+func TestIntentStep_Integration_ConcurrentWorktreeScope(t *testing.T) {
+	for _, kind := range []string{"scoped-winner", "missing-session", "unreadable-session", "moved-head", "legacy-head", "weak-score", "ambiguous-score"} {
+		t.Run(kind, func(t *testing.T) {
+			repoDir, home, base, head := initIntentRepo(t)
+			withFakeHome(t, home)
+			author := filepath.Join(t.TempDir(), "author A")
+			sibling := filepath.Join(t.TempDir(), "sibling B")
+			gitCmd(t, repoDir, "worktree", "add", "-b", "author-a", author, head)
+			gitCmd(t, repoDir, "worktree", "add", "-b", "sibling-b", sibling, head)
+			fixture := filepath.Join(home, ".claude", "projects", testClaudeProjectDirName(repoDir), "session.jsonl")
+			original, err := os.ReadFile(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cwd := range []string{author, sibling} {
+				dir := filepath.Join(home, ".claude", "projects", testClaudeProjectDirName(cwd))
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				oldJSON, newJSON := testJSONString(t, repoDir), testJSONString(t, cwd)
+				content := strings.ReplaceAll(string(original), oldJSON[1:len(oldJSON)-1], newJSON[1:len(newJSON)-1])
+				if cwd == sibling {
+					content = strings.ReplaceAll(content, `"s1"`, `"sibling"`)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "session.jsonl"), []byte(content), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Remove(fixture); err != nil {
+				t.Fatal(err)
+			}
+			authorFixture := filepath.Join(home, ".claude", "projects", testClaudeProjectDirName(author), "session.jsonl")
+			switch kind {
+			case "missing-session":
+				if err := os.Remove(authorFixture); err != nil {
+					t.Fatal(err)
+				}
+			case "unreadable-session":
+				if err := os.WriteFile(authorFixture, []byte("invalid transcript\n"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			case "moved-head":
+				gitCmd(t, author, "commit", "--allow-empty", "-m", "advanced")
+			case "weak-score":
+				for _, name := range []string{"bar.go", "baz.go"} {
+					if err := os.WriteFile(filepath.Join(author, name), []byte("package foo\n"), 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				gitCmd(t, author, "add", ".")
+				gitCmd(t, author, "commit", "-m", "multi-file change")
+				head = gitCmd(t, author, "rev-parse", "HEAD")
+				raw, err := os.ReadFile(authorFixture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				content := strings.ReplaceAll(string(raw), "please add Bar() to internal_foo.go", "please add Bar() to internal_foo.go and bar.go")
+				if err := os.WriteFile(authorFixture, []byte(content), 0644); err != nil {
+					t.Fatal(err)
+				}
+			case "ambiguous-score":
+				raw, err := os.ReadFile(authorFixture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(filepath.Dir(authorFixture), "competitor.jsonl"), raw, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sctx := newIntentIntegrationContext(t, repoDir, base, head, &config.Config{Intent: config.Intent{Enabled: true, Threshold: .2, SlackDays: 3}})
+			sctx.Run.Branch = "author-a"
+			if kind == "legacy-head" {
+				sctx.Run.SubmittedHeadSHA = nil
+			}
+			counting := &countingIntentAgent{}
+			sctx.Agent = counting
+			outcome, err := (&IntentStep{}).Execute(sctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := sctx.DB.GetRun(sctx.Run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			safe := kind == "scoped-winner" || kind == "legacy-head"
+			if safe {
+				if outcome.NeedsApproval || got.Intent == nil || counting.calls != 1 {
+					t.Fatalf("safe result %+v intent=%v calls=%d", outcome, got.Intent, counting.calls)
+				}
+			} else {
+				assertUnsafeIntentOutcome(t, sctx, outcome)
+				if counting.calls != 0 {
+					t.Fatalf("unsafe inference invoked summarizer %d times", counting.calls)
+				}
+			}
+		})
+	}
+}
+
+type countingIntentAgent struct {
+	fakeIntentAgent
+	calls int
+}
+
+func (a *countingIntentAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	a.calls++
+	return a.fakeIntentAgent.Run(ctx, opts)
+}
+
+func assertUnsafeIntentOutcome(t *testing.T, sctx *pipeline.StepContext, outcome *pipeline.StepOutcome) {
+	t.Helper()
+	if outcome == nil || !outcome.NeedsApproval || outcome.Skipped || outcome.AutoFixable {
+		t.Fatalf("unsafe outcome %+v", outcome)
+	}
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser || findings.Items[0].Severity != "warning" {
+		t.Fatalf("findings %+v, %v", findings, err)
+	}
+	got, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Intent != nil || got.IntentSource != nil || got.IntentScore != nil || sctx.Run.Intent != nil {
+		t.Fatalf("unsafe inference attached intent: %+v", got)
+	}
+}
+
+func TestIntentStep_Integration_AllDeletionDiff(t *testing.T) {
+	repo, home, base, _ := initIntentRepo(t)
+	withFakeHome(t, home)
+	gitCmd(t, repo, "rm", "internal_foo.go")
+	gitCmd(t, repo, "commit", "-m", "delete file")
+	head := gitCmd(t, repo, "rev-parse", "HEAD")
+	sctx := newIntentIntegrationContext(t, repo, base, head, &config.Config{Intent: config.Intent{Enabled: true, Threshold: .2, SlackDays: 3}})
+	outcome, err := (&IntentStep{}).Execute(sctx)
+	if err != nil || outcome.NeedsApproval || sctx.Run.IntentScore == nil || *sctx.Run.IntentScore != 1 {
+		t.Fatalf("outcome=%+v err=%v score=%v", outcome, err, sctx.Run.IntentScore)
 	}
 }
