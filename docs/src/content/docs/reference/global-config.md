@@ -817,7 +817,7 @@ When enabled and no intent was supplied directly for the run, no-mistakes can re
 | Field                     | Type       | Default | Description                                                |
 | ------------------------- | ---------- | ------- | ---------------------------------------------------------- |
 | `intent.enabled`          | `bool`     | `true`  | Enable transcript-based intent extraction                  |
-| `intent.threshold`        | `float`    | `0.2`   | Minimum raw match score for selecting a transcript session |
+| `intent.threshold`        | `float`    | `0.2`   | Additional lower bound on raw match score; cannot lower the hard safety floor of `0.85` |
 | `intent.slack_days`       | `int`      | `3`     | Extra days to look back before the change window           |
 | `intent.disabled_readers` | `string[]` | Empty   | Transcript readers to disable                              |
 
@@ -826,10 +826,19 @@ Valid `disabled_readers` values are `claude`, `codex`, `opencode`, `rovodev`, `p
 The match score is the share of matching files mentioned in a transcript session; deleted files are ignored when the diff also contains non-deleted changes.
 All-deletion diffs still match against the deleted changed files.
 Mentioning extra files does not reduce the score.
-For multi-file diffs, no-mistakes still requires at least two overlapping files and an effective minimum score of `0.5`.
+For multi-file diffs, no-mistakes still requires at least two overlapping files.
 Partial matches older than 24 hours are rejected unless their raw score is at least `0.8`.
-If exactly one accepted candidate has a raw score of at least `0.85`, that decisive candidate wins before recency ranking.
-Otherwise, accepted candidates are ranked by confidence, which combines the raw score with a small recency boost, with ties going to the most recent matching session, and ambiguous accepted candidates may be disambiguated by the configured pipeline agent.
+
+Automatic selection also requires a hard safety floor of `0.85` raw overlap, so the effective acceptance threshold is `max(0.85, intent.threshold)`.
+The stored default remains `0.2`; a repository or global value below `0.85` cannot re-enable a weak match.
+When more than one distinct overlapping session belongs to the source checkout, the winner must also lead the next distinct overlapping session by at least `0.10` raw score, including a runner-up just below the floor.
+These cutoffs are conservative acceptance rules, not confidence probabilities.
+Recency may appear in diagnostics but does not lift a candidate over the floor or break a near tie into an accepted match.
+Invalid or non-finite threshold values cannot bypass the floor.
+
+Inference is scoped to the unique local checkout of the run's branch at the original submitted head.
+Sibling worktrees, detached gate worktrees, and other clones of the same remote are not source evidence.
+Unsafe inference (weak, unscoped, or ambiguous matches, or an unverifiable source checkout) does not attach a summary.
 
 ### test.evidence
 

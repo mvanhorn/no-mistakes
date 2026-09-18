@@ -33,22 +33,28 @@ type ExtractParams struct {
 	HeadTime time.Time
 	// SlackDays extends WindowStart backwards. The plan called for 3 days.
 	SlackDays int
-	// Threshold is the minimum raw file-overlap score required before applying
-	// stricter multi-file and stale-partial acceptance rules.
+	// Threshold is an additional lower bound on raw file-overlap. Effective
+	// acceptance is max(decisiveMatchScore, Threshold); a low configured
+	// value cannot re-enable a weak match. Non-finite values are ignored.
 	Threshold float64
 	// Readers are the per-agent transcript readers to consult. Order is
-	// insignificant; matching accepts plausible candidates, prefers a single
-	// decisive raw-score match, and otherwise ranks by confidence or an optional
-	// Disambiguator.
+	// insignificant. Readers may search broadly; Extract still requires every
+	// selected session to resolve to OriginCWD's canonical checkout.
 	Readers []Reader
 	// Cache is consulted before summarization. Pass NewMemCache() if no DB.
 	Cache Cache
 	// Summarizer turns the chosen session's text into a short summary.
 	Summarizer Summarizer
-	// Disambiguator optionally chooses among multiple plausible sessions when
-	// file-overlap scoring is not decisive enough to pick one safely.
+	// Disambiguator is retained so the independent disambiguator implementation
+	// stays testable. Automatic selection no longer consults it: an LLM choice
+	// cannot overrule a failed margin, and a disambiguator error cannot yield
+	// a fallback winner.
 	Disambiguator Disambiguator
-	// Logf receives best-effort accepted candidate diagnostics. Nil disables logging.
+	// Recheck, if set, is invoked after a match is accepted and before a
+	// summary is attached from cache or the summarizer. Used to prove the
+	// source checkout still matches the run's branch and submitted head.
+	Recheck func() error
+	// Logf receives candidate diagnostics, including rejected sessions. Nil disables logging.
 	Logf func(format string, args ...any)
 }
 
@@ -56,12 +62,22 @@ type ExtractParams struct {
 // should treat this as a normal "no intent attached" outcome, not an error.
 var ErrNoMatch = errors.New("intent: no matching transcript")
 
-// Extract runs the discover -> match -> optional disambiguate -> cache ->
-// summarize pipeline and returns the final intent. It returns ErrNoMatch when
-// no session satisfies the matcher's threshold, overlap, and freshness
-// acceptance rules. Disambiguation failures fall back to the deterministic
-// match, except cleanup failures are returned because worktree side effects
-// may remain.
+// ErrUnsafeMatch indicates a positive but unusable candidate set: a weak
+// sole overlap, an ambiguous pair of overlapping sessions, transcripts that
+// belong to another checkout, or an unverifiable source checkout. Callers
+// must not attach a summary and should surface an ask-user finding.
+var ErrUnsafeMatch = errors.New("intent: unsafe transcript match")
+
+func unsafeMatchError(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrUnsafeMatch, fmt.Sprintf(format, args...))
+}
+
+// Extract runs the discover -> scope -> match -> cache -> summarize pipeline
+// and returns the final intent. It returns ErrNoMatch when there is a genuine
+// absence of relevant usable transcript evidence, including zero overlap. It
+// returns ErrUnsafeMatch when discovered transcripts are unscoped, weak, or
+// ambiguous, or when Recheck fails. Automatic selection never consults
+// Disambiguator.
 func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 	if p.OriginCWD == "" {
 		return nil, fmt.Errorf("intent: OriginCWD is required")
@@ -76,10 +92,12 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		return nil, fmt.Errorf("intent: Summarizer is required")
 	}
 
+	originTop := canonicalSourceCheckoutPath(ctx, p.OriginCWD)
+
 	slack := time.Duration(maxInt(p.SlackDays, 0)) * 24 * time.Hour
 	opts := DiscoverOpts{
 		HomeDir:     p.HomeDir,
-		OriginCWD:   canonicalPath(p.OriginCWD),
+		OriginCWD:   originTop,
 		WindowStart: p.BaseTime.Add(-slack),
 		WindowEnd:   p.HeadTime,
 	}
@@ -104,12 +122,26 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		return nil, ErrNoMatch
 	}
 
-	// Load message bodies only for sessions that look promising on metadata.
-	// At this stage we cannot score yet (need messages), so we load them all.
-	// Discover is supposed to keep the candidate set small via the time/cwd
-	// filter; if that's true, this is cheap.
-	var loaded []*Session
+	var scoped []*Session
 	for _, s := range sessions {
+		if !sessionInSourceCheckout(ctx, s.CWD, originTop) {
+			if p.Logf != nil {
+				p.Logf("candidate agent=%s session=%s cwd=%q decision=rejected reason=unscoped",
+					s.AgentName, s.SessionID, s.CWD)
+			}
+			continue
+		}
+		scoped = append(scoped, s)
+	}
+	if len(scoped) == 0 {
+		return nil, unsafeMatchError("discovered %d transcript(s) but none belong to the source checkout %s", len(sessions), originTop)
+	}
+
+	// Load message bodies only for sessions that already proved they belong
+	// to the source checkout. Sibling worktrees and same-remote clones never
+	// reach scoring, cache, or summarization.
+	var loaded []*Session
+	for _, s := range scoped {
 		var reader Reader
 		for _, r := range p.Readers {
 			if r != nil && r.Name() == s.AgentName {
@@ -127,17 +159,22 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		loaded = append(loaded, s)
 	}
 
-	match := pickMatchWithOptions(loaded, p.DiffFiles, matchOptions{
+	match, err := pickMatchWithOptions(loaded, p.DiffFiles, matchOptions{
 		Threshold: p.Threshold,
 		HeadTime:  p.HeadTime,
 		Logf:      p.Logf,
 	})
-	if match == nil {
-		return nil, ErrNoMatch
-	}
-	match, err := disambiguateMatch(ctx, p, match, loaded)
 	if err != nil {
 		return nil, err
+	}
+
+	if p.Recheck != nil {
+		if err := p.Recheck(); err != nil {
+			if errors.Is(err, ErrUnsafeMatch) {
+				return nil, err
+			}
+			return nil, unsafeMatchError("source checkout identity changed during extraction: %v", err)
+		}
 	}
 
 	key := cacheKeyFor(match.Session)
@@ -162,38 +199,6 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		SessionID: match.Session.SessionID,
 		Score:     match.Score,
 	}, nil
-}
-
-func disambiguateMatch(ctx context.Context, p ExtractParams, fallback *Match, loaded []*Session) (*Match, error) {
-	if p.Disambiguator == nil {
-		return fallback, nil
-	}
-	candidates := acceptedMatches(loaded, p.DiffFiles, matchOptions{
-		Threshold: p.Threshold,
-		HeadTime:  p.HeadTime,
-	})
-	if !shouldDisambiguate(candidates) {
-		return fallback, nil
-	}
-	choice, err := p.Disambiguator.Disambiguate(ctx, p.DiffFiles, candidates)
-	if err != nil {
-		if errors.Is(err, ErrDisambiguatorCleanup) {
-			return nil, fmt.Errorf("intent: disambiguator cleanup: %w", err)
-		}
-		if p.Logf != nil {
-			p.Logf("disambiguator failed: %v", err)
-		}
-		return fallback, nil
-	}
-	for _, candidate := range candidates {
-		if candidate.Session != nil && candidate.Session.AgentName == choice.AgentName && candidate.Session.SessionID == choice.SessionID {
-			return candidate, nil
-		}
-	}
-	if p.Logf != nil {
-		p.Logf("disambiguator returned unknown session %q/%q", choice.AgentName, choice.SessionID)
-	}
-	return fallback, nil
 }
 
 func maxInt(a, b int) int {

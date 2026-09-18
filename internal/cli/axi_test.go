@@ -103,6 +103,92 @@ func TestTruncateDisclosesTotal(t *testing.T) {
 	}
 }
 
+func TestRunObjectRendersIntentProvenanceFromDB(t *testing.T) {
+	source := "claude"
+	score := 0.92
+	rv := runView{
+		ID:           "run-1",
+		Branch:       "feature/x",
+		Status:       string(types.RunCompleted),
+		HeadSHA:      "abcdef1234567890",
+		IntentSource: &source,
+		IntentScore:  &score,
+	}
+	out := axiDoc(runObjectField(rv))
+	if !strings.Contains(out, "intent_source: claude") {
+		t.Fatalf("missing intent_source in:\n%s", out)
+	}
+	if !strings.Contains(out, "intent_score:") {
+		t.Fatalf("missing intent_score in:\n%s", out)
+	}
+	var doc struct {
+		Run struct {
+			IntentSource string  `toon:"intent_source"`
+			IntentScore  float64 `toon:"intent_score"`
+		} `toon:"run"`
+	}
+	if err := toon.UnmarshalString(out, &doc); err != nil {
+		t.Fatalf("decode: %v\n%s", err, out)
+	}
+	if doc.Run.IntentSource != "claude" {
+		t.Fatalf("decoded intent_source = %q", doc.Run.IntentSource)
+	}
+	if doc.Run.IntentScore != 0.92 {
+		t.Fatalf("decoded intent_score = %v, want 0.92", doc.Run.IntentScore)
+	}
+	if strings.Contains(out, "please add") || strings.Contains(out, ".jsonl") {
+		t.Fatalf("status leaked transcript content:\n%s", out)
+	}
+}
+
+func TestRunObjectOmitsIntentProvenanceWhenAbsentAndKeepsZeroScore(t *testing.T) {
+	missing := runView{ID: "run-1", Branch: "feature/x", Status: string(types.RunCompleted), HeadSHA: "abcdef1234567890"}
+	out := axiDoc(runObjectField(missing))
+	if strings.Contains(out, "intent_source") || strings.Contains(out, "intent_score") {
+		t.Fatalf("absent provenance must be omitted:\n%s", out)
+	}
+
+	zero := 0.0
+	agentSource := "agent"
+	zeroView := runView{
+		ID:           "run-2",
+		Branch:       "feature/x",
+		Status:       string(types.RunCompleted),
+		HeadSHA:      "abcdef1234567890",
+		IntentSource: &agentSource,
+		IntentScore:  &zero,
+	}
+	zeroOut := axiDoc(runObjectField(zeroView))
+	if !strings.Contains(zeroOut, "intent_source: agent") {
+		t.Fatalf("zero-score run missing intent_source:\n%s", zeroOut)
+	}
+	if !strings.Contains(zeroOut, "intent_score:") {
+		t.Fatalf("zero score must still be rendered:\n%s", zeroOut)
+	}
+	var doc struct {
+		Run struct {
+			IntentScore float64 `toon:"intent_score"`
+		} `toon:"run"`
+	}
+	if err := toon.UnmarshalString(zeroOut, &doc); err != nil {
+		t.Fatalf("decode: %v\n%s", err, zeroOut)
+	}
+	if doc.Run.IntentScore != 0 {
+		t.Fatalf("decoded zero score = %v", doc.Run.IntentScore)
+	}
+}
+
+func TestRunViewFromIPCOmitsIntentProvenance(t *testing.T) {
+	rv := runViewFromIPC(&ipc.RunInfo{ID: "run-1", Branch: "feature/x", HeadSHA: "abcdef1234567890", Status: types.RunCompleted})
+	if rv.IntentSource != nil || rv.IntentScore != nil {
+		t.Fatalf("IPC view must not invent intent provenance: source=%v score=%v", rv.IntentSource, rv.IntentScore)
+	}
+	out := axiDoc(runObjectField(rv))
+	if strings.Contains(out, "intent_source") || strings.Contains(out, "intent_score") {
+		t.Fatalf("IPC snapshot leaked invented provenance:\n%s", out)
+	}
+}
+
 func TestWriteRunObjectShape(t *testing.T) {
 	rv := runView{
 		ID:      "run-1",

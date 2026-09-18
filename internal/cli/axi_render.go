@@ -131,6 +131,12 @@ type runView struct {
 	// genuinely green run in agent-facing output.
 	CIOverrideReason   string
 	TestOverrideReason string
+	// IntentSource and IntentScore are persisted provenance. Nil means the
+	// run has no attached intent (including a missing-transcript skip). A
+	// non-nil score of 0 is distinct from absence and must still be rendered.
+	// IPC snapshots that lack these values leave them nil.
+	IntentSource *string
+	IntentScore  *float64
 }
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
@@ -188,6 +194,8 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 		Status:             string(r.Status),
 		HeadSHA:            r.HeadSHA,
 		AwaitingAgentSince: r.AwaitingAgentSince,
+		IntentSource:       r.IntentSource,
+		IntentScore:        r.IntentScore,
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -478,6 +486,12 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
 	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
+	if rv.IntentSource != nil {
+		fields = append(fields, toon.Field{Key: "intent_source", Value: *rv.IntentSource})
+	}
+	if rv.IntentScore != nil {
+		fields = append(fields, toon.Field{Key: "intent_score", Value: *rv.IntentScore})
+	}
 	if rv.TestOverrideReason != "" {
 		fields = append(fields, toon.Field{Key: "test_override_reason", Value: rv.TestOverrideReason})
 	}

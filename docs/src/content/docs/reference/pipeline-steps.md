@@ -46,14 +46,17 @@ This is best-effort context, and when available it is included in rebase fixes, 
 
 - Treats newly supplied explicit intent (`agent`) and exact inherited rerun intent (`rerun`) as authoritative acceptance criteria, while preserving their distinct sources, and skips transcript-based inference even when `intent.enabled` is false
 - Runs transcript-based inference only when `intent.enabled` is true
-- Matches local agent transcripts against non-deleted changed files when present, falling back to all changed files for all-deletion diffs, may use the configured pipeline agent to disambiguate plausible matches, and summarizes the likely author intent with that agent
+- Matches local agent transcripts against non-deleted changed files when present, falling back to all changed files for all-deletion diffs, and summarizes the likely author intent with the configured pipeline agent only when a session is uniquely and strongly associated with the source checkout
+- Requires the session to belong to the unique local checkout of the run's branch at the original submitted head; sibling worktrees, detached gate worktrees, and other clones of the same remote are not source evidence
+- Accepts a match only when its raw file-overlap is at least `max(0.85, intent.threshold)` and it leads every other distinct overlapping session in that checkout by at least `0.10`
 - Stores the derived summary, source, session ID, and match score on the run
-- Logs accepted candidate diagnostics, including source, session, CWD, score, confidence, overlap, decision, and acceptance reason
+- Logs candidate diagnostics, including source, session, CWD, score, confidence, overlap, decision, and acceptance or rejection reason
 - Logs the matched source, score, and sanitized inferred intent when a transcript matches
 - Skips instead of failing when disabled, no matching transcript is found, the diff is empty, extraction errors, or persistence fails
+- Parks with a warning `ask-user` finding when inference is unsafe (weak, unscoped, or ambiguous transcript evidence, or an unverifiable source checkout) and leaves intent unset so later steps and PR publication cannot inherit a guessed summary. Rerun with explicit `--intent` to supply acceptance criteria. Approving the gate without a summary follows the existing approval policy; no automatic fix agent invents intent
 
 This step does not block the pipeline for missing transcripts, summarization that exceeds the five-minute extraction cap, or other extraction failures, which are reported as skipped outcomes.
-It can fail the run only if cleanup fails after the disambiguation agent leaves worktree side effects.
+Unsafe transcript inference is not a skip: it parks for an operator decision so a weak or cross-checkout match cannot reach Review or PR publication.
 
 ## Rebase
 

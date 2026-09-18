@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 // fakeIntentAgent always returns a canned summary - bypasses any real LLM.
@@ -49,6 +50,7 @@ func initIntentRepo(t *testing.T) (repoDir, fakeHome, base, head string) {
 	gitCmd(t, repoDir, "add", ".")
 	gitCmd(t, repoDir, "commit", "-m", "head")
 	head = gitCmd(t, repoDir, "rev-parse", "HEAD")
+	gitCmd(t, repoDir, "checkout", "-B", "feature")
 
 	fakeHome = t.TempDir()
 	encoded := testClaudeProjectDirName(repoDir)
@@ -223,6 +225,7 @@ func TestIntentStep_Integration_DeletedFilesDoNotDiluteIntentMatch(t *testing.T)
 	gitCmd(t, repoDir, "add", ".")
 	gitCmd(t, repoDir, "commit", "-m", "replace obsolete code")
 	head := gitCmd(t, repoDir, "rev-parse", "HEAD")
+	gitCmd(t, repoDir, "checkout", "-B", "feature")
 
 	fakeHome := t.TempDir()
 	encoded := testClaudeProjectDirName(repoDir)
@@ -266,7 +269,7 @@ func TestIntentStep_Integration_ZeroBaseSHA_NewBranchPush(t *testing.T) {
 	repoDir, fakeHome, base, _ := initIntentRepo(t)
 	withFakeHome(t, fakeHome)
 
-	gitCmd(t, repoDir, "checkout", "-b", "feature", base)
+	gitCmd(t, repoDir, "checkout", "-B", "feature", base)
 	if err := os.WriteFile(filepath.Join(repoDir, "internal_foo.go"), []byte("package foo\nfunc Bar() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -332,6 +335,9 @@ func TestIntentStep_Integration_UsesPipelineWorkDirForGitState(t *testing.T) {
 	gitCmd(t, pipelineWorkDir, "commit", "-m", "head only in pipeline workdir")
 	head := gitCmd(t, pipelineWorkDir, "rev-parse", "HEAD")
 
+	gitCmd(t, originRepo, "fetch", pipelineWorkDir, "+HEAD:refs/heads/feature")
+	gitCmd(t, originRepo, "checkout", "feature")
+
 	cfg := &config.Config{Intent: config.Intent{Enabled: true, Threshold: 0.1, SlackDays: 3}}
 	sctx := newIntentIntegrationContext(t, originRepo, base, head, cfg)
 	sctx.WorkDir = pipelineWorkDir
@@ -365,7 +371,7 @@ func TestIntentStep_Integration_ForcePushedOrphanedBaseSHA(t *testing.T) {
 	// Branch off main and add a feature commit that touches internal_foo.go.
 	// initIntentRepo's main HEAD already contains func Bar(), so vary the
 	// content here to produce a real diff between feature and main.
-	gitCmd(t, repoDir, "checkout", "-b", "feature")
+	gitCmd(t, repoDir, "checkout", "-B", "feature")
 	if err := os.WriteFile(filepath.Join(repoDir, "internal_foo.go"), []byte("package foo\nfunc Bar() { /* feature */ }\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -417,5 +423,112 @@ func TestIntentStep_Integration_RespectsTimeout(t *testing.T) {
 	case <-done:
 	case <-time.After(intentExtractTimeout + 5*time.Second):
 		t.Fatal("IntentStep.Execute did not return within budget")
+	}
+}
+
+func TestIntentStep_Integration_SiblingWorktreeSelectsRunBranchCheckout(t *testing.T) {
+	repoDir := t.TempDir()
+	gitCmd(t, repoDir, "init", "-b", "main")
+	gitCmd(t, repoDir, "config", "user.email", "test@example.com")
+	gitCmd(t, repoDir, "config", "user.name", "Tester")
+	if err := os.WriteFile(filepath.Join(repoDir, "shared.go"), []byte("package shared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", ".")
+	gitCmd(t, repoDir, "commit", "-m", "base")
+	base := gitCmd(t, repoDir, "rev-parse", "HEAD")
+
+	gitCmd(t, repoDir, "checkout", "-b", "feature-a")
+	if err := os.WriteFile(filepath.Join(repoDir, "shared.go"), []byte("package shared\nfunc Alpha() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", ".")
+	gitCmd(t, repoDir, "commit", "-m", "alpha")
+	headA := gitCmd(t, repoDir, "rev-parse", "HEAD")
+
+	gitCmd(t, repoDir, "checkout", "main")
+	wtA := filepath.Join(t.TempDir(), "wt A")
+	gitCmd(t, repoDir, "worktree", "add", wtA, "feature-a")
+
+	gitCmd(t, repoDir, "checkout", "-b", "feature-b")
+	if err := os.WriteFile(filepath.Join(repoDir, "shared.go"), []byte("package shared\nfunc Beta() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", ".")
+	gitCmd(t, repoDir, "commit", "-m", "beta")
+
+	fakeHome := t.TempDir()
+	writeClaudeTranscript(t, fakeHome, wtA, "please add Alpha() to shared.go", filepath.Join(wtA, "shared.go"))
+	writeClaudeTranscript(t, fakeHome, repoDir, "please add Beta() to shared.go", filepath.Join(repoDir, "shared.go"))
+	withFakeHome(t, fakeHome)
+
+	cfg := &config.Config{Intent: config.Intent{Enabled: true, Threshold: 0.1, SlackDays: 3}}
+	sctx := newIntentIntegrationContext(t, repoDir, base, headA, cfg)
+	sctx.Run.Branch = "feature-a"
+	sctx.Run.HeadSHA = headA
+	sctx.Run.SubmittedHeadSHA = &headA
+
+	outcome, err := (&IntentStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if outcome == nil || outcome.Skipped || outcome.NeedsApproval {
+		t.Fatalf("expected attached intent from worktree A, got %+v", outcome)
+	}
+	got, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Intent == nil || !strings.Contains(*got.Intent, "Bar()") {
+		t.Fatalf("intent = %v, want canned summarizer output", got.Intent)
+	}
+	if got.IntentSource == nil || *got.IntentSource != "claude" {
+		t.Fatalf("source = %v, want claude", got.IntentSource)
+	}
+}
+
+func TestIntentStep_Integration_MissingSourceCheckoutParksAskUser(t *testing.T) {
+	repoDir, fakeHome, base, head := initIntentRepo(t)
+	withFakeHome(t, fakeHome)
+	gitCmd(t, repoDir, "checkout", "--detach", head)
+
+	cfg := &config.Config{Intent: config.Intent{Enabled: true, Threshold: 0.1, SlackDays: 3}}
+	sctx := newIntentIntegrationContext(t, repoDir, base, head, cfg)
+
+	outcome, err := (&IntentStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if outcome == nil || !outcome.NeedsApproval || outcome.Skipped {
+		t.Fatalf("expected unsafe ask-user park, got %+v", outcome)
+	}
+	if sctx.Run.Intent != nil {
+		t.Fatalf("intent attached despite missing source checkout: %q", *sctx.Run.Intent)
+	}
+	got, _ := sctx.DB.GetRun(sctx.Run.ID)
+	if got.Intent != nil {
+		t.Fatalf("persisted intent despite missing source checkout: %q", *got.Intent)
+	}
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatalf("parse findings: %v", err)
+	}
+	if len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser {
+		t.Fatalf("findings = %+v, want one ask-user item", findings.Items)
+	}
+}
+
+func writeClaudeTranscript(t *testing.T, fakeHome, cwd, userText, editedFile string) {
+	t.Helper()
+	encoded := testClaudeProjectDirName(cwd)
+	claudeDir := filepath.Join(fakeHome, ".claude", "projects", encoded)
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := `{"type":"user","cwd":` + testJSONString(t, cwd) + `,"timestamp":"2026-04-18T02:15:37.407Z","uuid":"u1","sessionId":"s1","message":{"role":"user","content":` + testJSONString(t, userText) + `}}
+{"type":"assistant","cwd":` + testJSONString(t, cwd) + `,"timestamp":"2026-04-18T02:15:38.000Z","uuid":"u2","sessionId":"s1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, editedFile) + `}}]}}
+`
+	if err := os.WriteFile(filepath.Join(claudeDir, "session.jsonl"), []byte(transcript), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

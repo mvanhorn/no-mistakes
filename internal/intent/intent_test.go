@@ -14,12 +14,24 @@ type staticReader struct {
 	name     string
 	sessions []*Session
 	opts     DiscoverOpts
+	keepCWD  bool
 }
 
 func (s *staticReader) Name() string { return s.name }
 func (s *staticReader) Discover(_ context.Context, opts DiscoverOpts) ([]*Session, error) {
 	s.opts = opts
-	return s.sessions, nil
+	if s.keepCWD {
+		return s.sessions, nil
+	}
+	out := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		copySess := *sess
+		if copySess.CWD == "" {
+			copySess.CWD = opts.OriginCWD
+		}
+		out = append(out, &copySess)
+	}
+	return out, nil
 }
 func (s *staticReader) Load(_ context.Context, _ *Session) error { return nil }
 
@@ -175,7 +187,7 @@ func TestExtract_CacheHitSkipsSummarizer(t *testing.T) {
 	}
 }
 
-func TestExtract_DisambiguatesWhenMultipleAcceptedCandidatesAreNotDecisive(t *testing.T) {
+func TestExtract_RefusesWhenMultipleAcceptedCandidatesAreNotDecisive(t *testing.T) {
 	first := &Session{
 		SessionID:    "s1",
 		LastActivity: time.Now(),
@@ -190,6 +202,7 @@ func TestExtract_DisambiguatesWhenMultipleAcceptedCandidatesAreNotDecisive(t *te
 	}
 	r := &staticReader{name: "claude", sessions: []*Session{first, second}}
 	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "s2"}
+	sum := &fixedSummarizer{summary: "selected second"}
 
 	got, err := Extract(context.Background(), ExtractParams{
 		OriginCWD:     "/tmp/repo",
@@ -198,20 +211,20 @@ func TestExtract_DisambiguatesWhenMultipleAcceptedCandidatesAreNotDecisive(t *te
 		BaseTime:      time.Now().Add(-time.Hour),
 		Threshold:     0.2,
 		Readers:       []Reader{r},
-		Summarizer:    &fixedSummarizer{summary: "selected second"},
+		Summarizer:    sum,
 		Disambiguator: d,
 	})
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch", err)
 	}
-	if d.calls != 1 {
-		t.Fatalf("disambiguator calls = %d, want 1", d.calls)
+	if got != nil {
+		t.Fatalf("unsafe match must not attach a summary, got %+v", got)
 	}
-	if len(d.candidates) != 2 {
-		t.Fatalf("disambiguator candidates = %d, want 2", len(d.candidates))
+	if d.calls != 0 {
+		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
 	}
-	if got.SessionID != "s2" {
-		t.Fatalf("selected session = %q, want s2", got.SessionID)
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
 	}
 }
 
@@ -250,7 +263,7 @@ func TestExtract_DoesNotDisambiguateSingleDecisiveCandidate(t *testing.T) {
 	}
 }
 
-func TestExtract_DisambiguatesWhenMultipleCandidatesAreDecisive(t *testing.T) {
+func TestExtract_RefusesWhenMultipleCandidatesAreDecisive(t *testing.T) {
 	first := &Session{
 		SessionID:    "s1",
 		LastActivity: time.Now(),
@@ -263,6 +276,7 @@ func TestExtract_DisambiguatesWhenMultipleCandidatesAreDecisive(t *testing.T) {
 	}
 	r := &staticReader{name: "claude", sessions: []*Session{first, second}}
 	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "s2"}
+	sum := &fixedSummarizer{summary: "selected second"}
 
 	got, err := Extract(context.Background(), ExtractParams{
 		OriginCWD:     "/tmp/repo",
@@ -271,21 +285,24 @@ func TestExtract_DisambiguatesWhenMultipleCandidatesAreDecisive(t *testing.T) {
 		BaseTime:      time.Now().Add(-time.Hour),
 		Threshold:     0.2,
 		Readers:       []Reader{r},
-		Summarizer:    &fixedSummarizer{summary: "selected second"},
+		Summarizer:    sum,
 		Disambiguator: d,
 	})
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch", err)
 	}
-	if d.calls != 1 {
-		t.Fatalf("disambiguator calls = %d, want 1", d.calls)
+	if got != nil {
+		t.Fatalf("equal 1.0 matches must not attach a summary, got %+v", got)
 	}
-	if got.SessionID != "s2" {
-		t.Fatalf("selected session = %q, want s2", got.SessionID)
+	if d.calls != 0 {
+		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
 	}
 }
 
-func TestExtract_DisambiguatorSelectionUsesAgentNameAndSessionID(t *testing.T) {
+func TestExtract_DisambiguatorChoiceCannotRescueAmbiguousSet(t *testing.T) {
 	headTime := time.Now()
 	claude := &staticReader{name: "claude", sessions: []*Session{{
 		SessionID:    "same",
@@ -298,6 +315,7 @@ func TestExtract_DisambiguatorSelectionUsesAgentNameAndSessionID(t *testing.T) {
 		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go"}}},
 	}}}
 	d := &fixedDisambiguator{selectedAgentName: "opencode", selectedSessionID: "same"}
+	sum := &fixedSummarizer{summary: "selected opencode"}
 
 	got, err := Extract(context.Background(), ExtractParams{
 		OriginCWD:     "/tmp/repo",
@@ -306,18 +324,24 @@ func TestExtract_DisambiguatorSelectionUsesAgentNameAndSessionID(t *testing.T) {
 		BaseTime:      headTime.Add(-time.Hour),
 		Threshold:     0.2,
 		Readers:       []Reader{claude, opencode},
-		Summarizer:    &fixedSummarizer{summary: "selected opencode"},
+		Summarizer:    sum,
 		Disambiguator: d,
 	})
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch", err)
 	}
-	if got.AgentName != "opencode" || got.SessionID != "same" {
-		t.Fatalf("selected = %s/%s, want opencode/same", got.AgentName, got.SessionID)
+	if got != nil {
+		t.Fatalf("disambiguator choice must not attach a summary, got %+v", got)
+	}
+	if d.calls != 0 {
+		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
 	}
 }
 
-func TestExtract_ReturnsErrorWhenDisambiguatorCleanupFails(t *testing.T) {
+func TestExtract_DisambiguatorFailureDoesNotRescueAmbiguousSet(t *testing.T) {
 	headTime := time.Now()
 	r := &staticReader{name: "claude", sessions: []*Session{
 		{
@@ -332,23 +356,33 @@ func TestExtract_ReturnsErrorWhenDisambiguatorCleanupFails(t *testing.T) {
 		},
 	}}
 	d := &fixedDisambiguator{err: ErrDisambiguatorCleanup}
+	sum := &fixedSummarizer{summary: "fallback"}
 
-	_, err := Extract(context.Background(), ExtractParams{
+	got, err := Extract(context.Background(), ExtractParams{
 		OriginCWD:     "/tmp/repo",
 		DiffFiles:     []string{"foo.go", "bar.go"},
 		HeadTime:      headTime,
 		BaseTime:      headTime.Add(-time.Hour),
 		Threshold:     0.2,
 		Readers:       []Reader{r},
-		Summarizer:    &fixedSummarizer{summary: "fallback"},
+		Summarizer:    sum,
 		Disambiguator: d,
 	})
-	if !errors.Is(err, ErrDisambiguatorCleanup) {
-		t.Fatalf("error = %v, want ErrDisambiguatorCleanup", err)
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch (not disambiguator fallback)", err)
+	}
+	if got != nil {
+		t.Fatalf("disambiguator failure must not yield a fallback winner, got %+v", got)
+	}
+	if d.calls != 0 {
+		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
 	}
 }
 
-func TestExtract_SingleDecisiveCandidateBeatsRecentPartialMatch(t *testing.T) {
+func TestExtract_NearTieWithRecencyBoostStillRefuses(t *testing.T) {
 	headTime := time.Now()
 	diffFiles := []string{
 		"a.go", "b.go", "c.go", "d.go", "e.go",
@@ -368,6 +402,7 @@ func TestExtract_SingleDecisiveCandidateBeatsRecentPartialMatch(t *testing.T) {
 	}
 	r := &staticReader{name: "claude", sessions: []*Session{recentPartial, decisive}}
 	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "recent-partial"}
+	sum := &fixedSummarizer{summary: "selected decisive"}
 
 	got, err := Extract(context.Background(), ExtractParams{
 		OriginCWD:     "/tmp/repo",
@@ -376,17 +411,17 @@ func TestExtract_SingleDecisiveCandidateBeatsRecentPartialMatch(t *testing.T) {
 		BaseTime:      headTime.Add(-time.Hour),
 		Threshold:     0.2,
 		Readers:       []Reader{r},
-		Summarizer:    &fixedSummarizer{summary: "selected decisive"},
+		Summarizer:    sum,
 		Disambiguator: d,
 	})
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch for 0.85 vs 0.80", err)
+	}
+	if got != nil {
+		t.Fatalf("recency must not break a near tie, got %+v", got)
 	}
 	if d.calls != 0 {
 		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
-	}
-	if got.SessionID != "decisive" {
-		t.Fatalf("selected session = %q, want decisive", got.SessionID)
 	}
 }
 
@@ -401,7 +436,7 @@ func TestExtract_NoReaders(t *testing.T) {
 	}
 }
 
-func TestExtract_LogsAcceptedCandidatesOnly(t *testing.T) {
+func TestExtract_LogsRejectedCandidatesWithReasons(t *testing.T) {
 	r := &staticReader{
 		name: "opencode",
 		sessions: []*Session{{
@@ -413,11 +448,11 @@ func TestExtract_LogsAcceptedCandidatesOnly(t *testing.T) {
 			SessionID:    "strong",
 			CWD:          "/tmp/repo",
 			LastActivity: time.Now(),
-			Messages:     []Message{{FilePaths: []string{"b.go", "c.go"}}},
+			Messages:     []Message{{FilePaths: []string{"a.go", "b.go", "c.go"}}},
 		}},
 	}
 	var logs []string
-	_, err := Extract(context.Background(), ExtractParams{
+	got, err := Extract(context.Background(), ExtractParams{
 		OriginCWD:  "/tmp/repo",
 		DiffFiles:  []string{"a.go", "b.go", "c.go"},
 		HeadTime:   time.Now(),
@@ -432,15 +467,13 @@ func TestExtract_LogsAcceptedCandidatesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extract: %v", err)
 	}
+	if got.SessionID != "strong" {
+		t.Fatalf("selected session = %q, want strong", got.SessionID)
+	}
 	joined := strings.Join(logs, "\n")
-	for _, want := range []string{"candidate", "opencode", "strong", "accepted"} {
+	for _, want := range []string{"candidate", "opencode", "strong", "accepted", "weak", "rejected", "single_overlap_multi_file_diff"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("logs missing %q:\n%s", want, joined)
-		}
-	}
-	for _, unwanted := range []string{"weak", "rejected", "no_overlap", "single_overlap_multi_file_diff"} {
-		if strings.Contains(joined, unwanted) {
-			t.Fatalf("logs contain rejected candidate detail %q:\n%s", unwanted, joined)
 		}
 	}
 }
@@ -452,5 +485,183 @@ func TestExtract_RequiresOriginCWD(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("expected error when OriginCWD missing")
+	}
+}
+
+func TestExtract_FiltersUnscopedSessionsCentrally(t *testing.T) {
+	origin := "/tmp/repo"
+	sibling := &Session{
+		SessionID:    "sibling",
+		CWD:          "/tmp/other-worktree",
+		LastActivity: time.Now(),
+		Messages:     []Message{{FilePaths: []string{"foo.go"}}},
+	}
+	clone := &Session{
+		SessionID:    "clone",
+		CWD:          "/tmp/same-remote-clone",
+		LastActivity: time.Now(),
+		Messages:     []Message{{FilePaths: []string{"foo.go"}}},
+	}
+	empty := &Session{
+		SessionID:    "empty",
+		CWD:          "",
+		LastActivity: time.Now(),
+		Messages:     []Message{{FilePaths: []string{"foo.go"}}},
+	}
+	scoped := &Session{
+		SessionID:    "scoped",
+		CWD:          origin,
+		LastActivity: time.Now().Add(-time.Minute),
+		Messages:     []Message{{FilePaths: []string{"foo.go"}}},
+	}
+	r := &staticReader{name: "claude", sessions: []*Session{sibling, clone, empty, scoped}, keepCWD: true}
+	sum := &fixedSummarizer{summary: "scoped only"}
+	var logs []string
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:  origin,
+		DiffFiles:  []string{"foo.go"},
+		HeadTime:   time.Now(),
+		BaseTime:   time.Now().Add(-time.Hour),
+		Threshold:  0.2,
+		Readers:    []Reader{r},
+		Summarizer: sum,
+		Logf: func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.SessionID != "scoped" {
+		t.Fatalf("selected = %q, want scoped", got.SessionID)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, want := range []string{"sibling", "clone", "empty", "unscoped"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("logs missing unscoped rejection %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestExtract_DiscoveredUnscopedOnlyIsUnsafeNotNoMatch(t *testing.T) {
+	r := &staticReader{
+		name: "claude",
+		sessions: []*Session{{
+			SessionID:    "other",
+			CWD:          "/tmp/other",
+			LastActivity: time.Now(),
+			Messages:     []Message{{FilePaths: []string{"foo.go"}}},
+		}},
+		keepCWD: true,
+	}
+	sum := &fixedSummarizer{summary: "should not run"}
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:  "/tmp/repo",
+		DiffFiles:  []string{"foo.go"},
+		HeadTime:   time.Now(),
+		BaseTime:   time.Now().Add(-time.Hour),
+		Threshold:  0.2,
+		Readers:    []Reader{r},
+		Summarizer: sum,
+	})
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch for discovered-but-unscoped", err)
+	}
+	if got != nil {
+		t.Fatalf("unscoped-only must not attach a summary, got %+v", got)
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
+	}
+	if !strings.Contains(err.Error(), "none belong to the source checkout") {
+		t.Fatalf("error should distinguish unscoped from absent, got %v", err)
+	}
+}
+
+func TestExtract_CachedSummaryCannotBypassUnsafeMatch(t *testing.T) {
+	sess := &Session{
+		SessionID:    "weak",
+		LastActivity: time.Now(),
+		LastMsgKey:   "k1",
+		Messages:     []Message{{Role: RoleUser, FilePaths: numberedFiles(15)[:10]}},
+	}
+	r := &staticReader{name: "claude", sessions: []*Session{sess}}
+	sum := &fixedSummarizer{summary: "fresh"}
+	cache := NewMemCache()
+	sess.AgentName = "claude"
+	cache.Put(cacheKeyFor(sess), "cached-unsafe", "claude", "weak")
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:  "/tmp/repo",
+		DiffFiles:  numberedFiles(15),
+		HeadTime:   time.Now(),
+		BaseTime:   time.Now().Add(-time.Hour),
+		Threshold:  0.2,
+		Readers:    []Reader{r},
+		Cache:      cache,
+		Summarizer: sum,
+	})
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch", err)
+	}
+	if got != nil {
+		t.Fatalf("cached summary must not bypass acceptance, got %+v", got)
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
+	}
+}
+
+func TestExtract_RecheckFailureDoesNotAttachSummary(t *testing.T) {
+	r := &staticReader{name: "claude", sessions: []*Session{{
+		SessionID:    "s1",
+		LastActivity: time.Now(),
+		LastMsgKey:   "k1",
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go"}}},
+	}}}
+	sum := &fixedSummarizer{summary: "should not run"}
+	cache := NewMemCache()
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:  "/tmp/repo",
+		DiffFiles:  []string{"foo.go"},
+		HeadTime:   time.Now(),
+		BaseTime:   time.Now().Add(-time.Hour),
+		Threshold:  0.2,
+		Readers:    []Reader{r},
+		Cache:      cache,
+		Summarizer: sum,
+		Recheck: func() error {
+			return unsafeMatchError("branch switched during extraction")
+		},
+	})
+	if !errors.Is(err, ErrUnsafeMatch) {
+		t.Fatalf("error = %v, want ErrUnsafeMatch", err)
+	}
+	if got != nil {
+		t.Fatalf("recheck failure must not attach a summary, got %+v", got)
+	}
+	if sum.calls != 0 {
+		t.Fatalf("summarizer calls = %d, want 0", sum.calls)
+	}
+}
+
+func TestExtract_ZeroOverlapIsNoMatch(t *testing.T) {
+	r := &staticReader{name: "claude", sessions: []*Session{{
+		SessionID:    "s1",
+		LastActivity: time.Now(),
+		Messages:     []Message{{Role: RoleUser, Text: "hello"}},
+	}}}
+	_, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:  "/tmp/repo",
+		DiffFiles:  []string{"foo.go", "bar.go"},
+		HeadTime:   time.Now(),
+		BaseTime:   time.Now().Add(-time.Hour),
+		Threshold:  0.2,
+		Readers:    []Reader{r},
+		Summarizer: &fixedSummarizer{summary: "x"},
+	})
+	if !errors.Is(err, ErrNoMatch) {
+		t.Fatalf("error = %v, want ErrNoMatch for zero overlap", err)
 	}
 }

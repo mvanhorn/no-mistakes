@@ -22,10 +22,12 @@ const intentExtractTimeout = 300 * time.Second
 
 // IntentStep is a best-effort pipeline step that infers the user's intent
 // from local agent transcripts and attaches it to the run so downstream
-// steps can surface it in their prompts. Failures are intentionally
-// swallowed and surface as a "skipped" outcome rather than a run failure:
-// missing transcripts, slow summarizers, or DB hiccups must not block
-// the pipeline. Disambiguator cleanup failures are fatal because they may leave
+// steps can surface it in their prompts. Missing transcripts, empty diffs,
+// slow summarizers, or DB hiccups are skipped rather than failing the run.
+// Unsafe inference (weak, unscoped, or ambiguous transcript evidence, or an
+// unverifiable source checkout) parks with an ask-user warning and leaves
+// intent unset so later steps and PR publication cannot inherit a guessed
+// summary. Disambiguator cleanup failures remain fatal because they may leave
 // worktree side effects that could affect later steps.
 type IntentStep struct {
 	// runIntent computes the intent for a step context. It is overridden
@@ -101,6 +103,9 @@ func (s *IntentStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.Step
 
 	result, runErr := runFn(ctx, sctx)
 	if runErr != nil {
+		if errors.Is(runErr, intent.ErrUnsafeMatch) {
+			return unsafeIntentOutcome(sctx, runErr, &outcomeLabel)
+		}
 		if errors.Is(runErr, intent.ErrNoMatch) {
 			outcomeLabel = "no_match"
 			sctx.Log("no matching agent transcript found")
@@ -207,21 +212,53 @@ func defaultRunIntent(ctx context.Context, sctx *pipeline.StepContext) (*intent.
 		}
 	}
 
+	submittedHead := strings.TrimSpace(run.HeadSHA)
+	if run.SubmittedHeadSHA != nil && strings.TrimSpace(*run.SubmittedHeadSHA) != "" {
+		submittedHead = strings.TrimSpace(*run.SubmittedHeadSHA)
+	}
+	checkout, err := intent.ResolveSourceCheckout(ctx, repo.WorkingPath, run.Branch, submittedHead)
+	if err != nil {
+		return nil, err
+	}
+
 	return intent.Extract(ctx, intent.ExtractParams{
-		OriginCWD:     repo.WorkingPath,
-		DiffFiles:     diffFiles,
-		BaseTime:      baseTime,
-		HeadTime:      headTime,
-		SlackDays:     cfg.Intent.SlackDays,
-		Threshold:     cfg.Intent.Threshold,
-		Readers:       intent.AllReaders(cfg.Intent.DisabledReaders),
-		Cache:         intent.NewDBCache(sctx.DB),
-		Summarizer:    intent.NewAgentSummarizer(sctx.Agent, gitWorkDir),
-		Disambiguator: intent.NewAgentDisambiguator(sctx.Agent, gitWorkDir),
+		OriginCWD:  checkout.Path,
+		DiffFiles:  diffFiles,
+		BaseTime:   baseTime,
+		HeadTime:   headTime,
+		SlackDays:  cfg.Intent.SlackDays,
+		Threshold:  cfg.Intent.Threshold,
+		Readers:    intent.AllReaders(cfg.Intent.DisabledReaders),
+		Cache:      intent.NewDBCache(sctx.DB),
+		Summarizer: intent.NewAgentSummarizer(sctx.Agent, gitWorkDir),
+		Recheck:    func() error { return checkout.Verify(ctx) },
 		Logf: func(format string, args ...any) {
 			sctx.Log(fmt.Sprintf("intent "+format, args...))
 		},
 	})
+}
+
+func unsafeIntentOutcome(sctx *pipeline.StepContext, runErr error, outcomeLabel *string) (*pipeline.StepOutcome, error) {
+	*outcomeLabel = "unsafe_match"
+	desc := fmt.Sprintf("Could not safely infer user intent from local agent transcripts (%v). Rerun with explicit intent via `no-mistakes axi run --intent \"...\"` (or `no-mistakes rerun --intent \"...\"`). Approving this gate without an inferred summary leaves later steps without inferred acceptance criteria; no automatic fix agent will invent intent.", runErr)
+	if sctx != nil && sctx.Log != nil {
+		sctx.Log(desc)
+	}
+	encoded, err := types.MarshalFindingsJSON(types.Findings{
+		Summary: "Unsafe intent transcript inference",
+		Items: []types.Finding{{
+			Severity:    types.FindingSeverityWarning,
+			Description: desc,
+			Action:      types.ActionAskUser,
+		}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal unsafe intent finding: %w", err)
+	}
+	return &pipeline.StepOutcome{
+		NeedsApproval: true,
+		Findings:      encoded,
+	}, nil
 }
 
 func diffFilesForIntentMatching(ctx context.Context, dir, base, head string) ([]string, error) {

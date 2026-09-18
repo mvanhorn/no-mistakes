@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	toon "github.com/toon-format/toon-go"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -557,4 +558,101 @@ func TestAxiDetachedHEADHelpOffersOnlyValidActions(t *testing.T) {
 			t.Fatalf("detached logs suggested starting a run:\n%s", got)
 		}
 	})
+}
+
+func TestAxiStatusRendersPersistedIntentProvenance(t *testing.T) {
+	repoDir, _, database, repo := setupAxiQueryRepo(t)
+	run(t, repoDir, "git", "checkout", "-b", "feature/mine")
+	chdir(t, repoDir)
+
+	inferred, err := database.InsertRun(repo.ID, "feature/mine", "head-mine", "base")
+	if err != nil {
+		t.Fatalf("insert inferred run: %v", err)
+	}
+	if err := database.UpdateRunIntent(inferred.ID, db.RunIntent{
+		Summary:   "please add a Bar() helper from the private transcript",
+		Source:    "claude",
+		SessionID: "sess-secret",
+		Score:     0.92,
+	}); err != nil {
+		t.Fatalf("persist inferred intent: %v", err)
+	}
+	if err := database.UpdateRunStatus(inferred.ID, types.RunCompleted); err != nil {
+		t.Fatalf("complete inferred run: %v", err)
+	}
+
+	out := axiStatusOutput(t, "")
+	if !strings.Contains(out, "intent_source: claude") {
+		t.Fatalf("status missing inferred intent_source:\n%s", out)
+	}
+	var doc struct {
+		Run struct {
+			ID           string  `toon:"id"`
+			IntentSource string  `toon:"intent_source"`
+			IntentScore  float64 `toon:"intent_score"`
+		} `toon:"run"`
+	}
+	if err := toon.UnmarshalString(out, &doc); err != nil {
+		t.Fatalf("decode status: %v\n%s", err, out)
+	}
+	if doc.Run.ID != inferred.ID || doc.Run.IntentSource != "claude" || doc.Run.IntentScore != 0.92 {
+		t.Fatalf("decoded provenance = %+v", doc.Run)
+	}
+	for _, leaked := range []string{"please add a Bar()", "sess-secret", ".jsonl"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("status leaked transcript content %q:\n%s", leaked, out)
+		}
+	}
+
+	explicit, err := database.InsertRun(repo.ID, "feature/other", "head-other", "base")
+	if err != nil {
+		t.Fatalf("insert explicit run: %v", err)
+	}
+	if err := database.UpdateRunIntent(explicit.ID, db.RunIntent{Summary: "explicit goal", Source: "agent", Score: 1}); err != nil {
+		t.Fatalf("persist explicit intent: %v", err)
+	}
+	if err := database.UpdateRunStatus(explicit.ID, types.RunCompleted); err != nil {
+		t.Fatalf("complete explicit run: %v", err)
+	}
+
+	foreign := axiStatusOutput(t, explicit.ID)
+	if !strings.Contains(foreign, "intent_source: agent") {
+		t.Fatalf("foreign --run missing explicit intent_source:\n%s", foreign)
+	}
+	if strings.Contains(foreign, "explicit goal") {
+		t.Fatalf("foreign --run leaked intent text:\n%s", foreign)
+	}
+
+	rerun, err := database.InsertRun(repo.ID, "feature/rerun", "head-rerun", "base")
+	if err != nil {
+		t.Fatalf("insert rerun: %v", err)
+	}
+	if err := database.UpdateRunIntent(rerun.ID, db.RunIntent{Summary: "inherited", Source: "rerun", Score: 1}); err != nil {
+		t.Fatalf("persist rerun intent: %v", err)
+	}
+	rerunOut := axiStatusOutput(t, rerun.ID)
+	if !strings.Contains(rerunOut, "intent_source: rerun") {
+		t.Fatalf("rerun provenance missing:\n%s", rerunOut)
+	}
+
+	zero, err := database.InsertRun(repo.ID, "feature/zero", "head-zero", "base")
+	if err != nil {
+		t.Fatalf("insert zero-score run: %v", err)
+	}
+	if err := database.UpdateRunIntent(zero.ID, db.RunIntent{Summary: "zero", Source: "claude", Score: 0}); err != nil {
+		t.Fatalf("persist zero score: %v", err)
+	}
+	zeroOut := axiStatusOutput(t, zero.ID)
+	if !strings.Contains(zeroOut, "intent_score:") {
+		t.Fatalf("zero score must be rendered:\n%s", zeroOut)
+	}
+
+	missing, err := database.InsertRun(repo.ID, "feature/missing", "head-missing", "base")
+	if err != nil {
+		t.Fatalf("insert missing-intent run: %v", err)
+	}
+	missingOut := axiStatusOutput(t, missing.ID)
+	if strings.Contains(missingOut, "intent_source") || strings.Contains(missingOut, "intent_score") {
+		t.Fatalf("missing intent must omit provenance:\n%s", missingOut)
+	}
 }

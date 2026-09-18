@@ -13,6 +13,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/intent"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 // fakeGitHubPAT reconstructs a GitHub-PAT-shaped test value at runtime via
@@ -154,6 +155,54 @@ func TestIntentStep_SuccessSanitizesLoggedIntentOnly(t *testing.T) {
 	}
 	if !strings.Contains(joined, "[REDACTED]") {
 		t.Errorf("expected logged intent to include redaction marker:\n%s", joined)
+	}
+}
+
+func TestIntentStep_UnsafeMatchParksAskUserWithoutAttachingIntent(t *testing.T) {
+	sctx := newIntentStepContext(t)
+	var logs []string
+	sctx.Log = func(s string) { logs = append(logs, s) }
+	step := &IntentStep{
+		runIntent: func(_ context.Context, _ *pipeline.StepContext) (*intent.Result, error) {
+			return nil, fmt.Errorf("%w: overlapping sessions are too close", intent.ErrUnsafeMatch)
+		},
+	}
+
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if outcome == nil || outcome.Skipped || !outcome.NeedsApproval {
+		t.Fatalf("expected ask-user park, got %+v", outcome)
+	}
+	if sctx.Run.Intent != nil || sctx.Run.IntentSource != nil || sctx.Run.IntentSessionID != nil || sctx.Run.IntentScore != nil {
+		t.Fatalf("in-memory intent must stay unset, got intent=%v source=%v session=%v score=%v",
+			sctx.Run.Intent, sctx.Run.IntentSource, sctx.Run.IntentSessionID, sctx.Run.IntentScore)
+	}
+	persisted, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if persisted.Intent != nil || persisted.IntentSource != nil || persisted.IntentSessionID != nil || persisted.IntentScore != nil {
+		t.Fatalf("db intent must stay unset, got %+v", persisted)
+	}
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatalf("parse findings: %v", err)
+	}
+	if len(findings.Items) != 1 {
+		t.Fatalf("findings = %+v, want one ask-user warning", findings.Items)
+	}
+	item := findings.Items[0]
+	if item.Action != types.ActionAskUser || item.Severity != types.FindingSeverityWarning {
+		t.Fatalf("finding = %+v, want warning ask-user", item)
+	}
+	if !strings.Contains(item.Description, "--intent") {
+		t.Fatalf("finding should tell the operator to rerun with --intent:\n%s", item.Description)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "--intent") {
+		t.Fatalf("logs should mention --intent recovery:\n%s", joined)
 	}
 }
 
@@ -315,6 +364,33 @@ func TestIntentStep_PanicReturnsSkipped(t *testing.T) {
 	}
 	if outcome == nil || !outcome.Skipped {
 		t.Errorf("expected Skipped on panic, got %+v", outcome)
+	}
+}
+
+func TestIntentStep_UsesSuppliedIntentWhenExtractionDisabled(t *testing.T) {
+	sctx := newIntentStepContext(t)
+	sctx.Config.Intent.Enabled = false
+	supplied := "agent-supplied while extraction is disabled"
+	sctx.Run.Intent = &supplied
+	called := false
+	step := &IntentStep{
+		runIntent: func(_ context.Context, _ *pipeline.StepContext) (*intent.Result, error) {
+			called = true
+			return nil, errors.New("runIntent must not be called")
+		},
+	}
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if outcome == nil || outcome.Skipped {
+		t.Fatalf("supplied intent should succeed even when extraction is disabled, got %+v", outcome)
+	}
+	if called {
+		t.Fatal("runIntent was called despite supplied intent")
+	}
+	if sctx.Run.Intent == nil || *sctx.Run.Intent != supplied {
+		t.Errorf("supplied intent was mutated: %v", sctx.Run.Intent)
 	}
 }
 

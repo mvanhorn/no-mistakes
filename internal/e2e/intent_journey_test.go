@@ -142,6 +142,96 @@ func TestIntentJourney(t *testing.T) {
 	}
 }
 
+func TestIntentJourneyConcurrentWorktreeSelectsRunBranch(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: writeConcurrentIntentScenario(t)})
+	if out, err := h.RunInDir(h.WorkDir, "init"); err != nil {
+		t.Fatalf("nm init: %v\n%s", err, out)
+	}
+
+	branchA := "feature/intent-a"
+	h.CommitChange(branchA, "shared.txt", "Alpha\n", "add alpha")
+	wtA := h.AddWorktree(branchA)
+
+	branchB := "feature/intent-b"
+	h.CommitChange(branchB, "shared.txt", "Beta\n", "add beta")
+
+	seedClaudeTranscriptWithText(t, h.HomeDir, wtA, "shared.txt", "please add AlphaGoal to shared.txt")
+	seedClaudeTranscriptWithText(t, h.HomeDir, h.WorkDir, "shared.txt", "please add BetaGoal to shared.txt")
+
+	h.PushToGate(branchA)
+	run := h.WaitForRun(branchA, 90*time.Second)
+	if run.Status != types.RunCompleted {
+		errMsg := ""
+		if run.Error != nil {
+			errMsg = *run.Error
+		}
+		t.Fatalf("run status = %q, want completed; error = %s", run.Status, errMsg)
+	}
+
+	intent := readRunIntent(t, h.NMHome, run.ID)
+	if intent.summary == nil || !strings.Contains(*intent.summary, "AlphaGoal") {
+		t.Fatalf("persisted intent = %v, want AlphaGoal from worktree A", intent.summary)
+	}
+	if intent.summary != nil && strings.Contains(*intent.summary, "BetaGoal") {
+		t.Fatalf("persisted sibling intent: %q", *intent.summary)
+	}
+
+	invocations := h.AgentInvocations()
+	reviewPrompt := findInvocationContaining(invocations, "Review the code changes and return structured findings")
+	if reviewPrompt == "" {
+		t.Fatalf("no review-step prompt; invocations:\n%s", dumpPrompts(invocations))
+	}
+	if !strings.Contains(reviewPrompt, "AlphaGoal") {
+		t.Fatalf("review prompt missing own-checkout intent:\n%s", truncate(reviewPrompt, 2000))
+	}
+	if strings.Contains(reviewPrompt, "BetaGoal") {
+		t.Fatalf("review prompt carried sibling-branch intent:\n%s", truncate(reviewPrompt, 2000))
+	}
+}
+
+func TestIntentJourneyWeakOnlyParksWithoutReview(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: writeIntentScenario(t)})
+	if out, err := h.RunInDir(h.WorkDir, "init"); err != nil {
+		t.Fatalf("nm init: %v\n%s", err, out)
+	}
+
+	branch := "feature/intent-weak"
+	h.CommitChange(branch, "a.go", "package a\n", "add a")
+	h.CommitChange(branch, "b.go", "package b\n", "add b")
+	h.CommitChange(branch, "c.go", "package c\n", "add c")
+	seedClaudeTranscriptWithText(t, h.HomeDir, h.WorkDir, "a.go", "please edit a.go and b.go")
+
+	h.PushToGate(branch)
+	run := waitForStepStatus(t, h, branch, types.StepIntent, types.StepStatusAwaitingApproval, 90*time.Second)
+	if run == nil {
+		t.Fatal("expected intent step to park")
+	}
+
+	intent := readRunIntent(t, h.NMHome, run.ID)
+	if intent.summary != nil || intent.source != nil || intent.score != nil {
+		t.Fatalf("unsafe inference must not persist intent columns: %+v", intent)
+	}
+
+	invocations := h.AgentInvocations()
+	if anyInvocationContains(invocations, "Review the code changes and return structured findings") {
+		t.Fatalf("unsafe inference reached Review:\n%s", dumpPrompts(invocations))
+	}
+	if anyInvocationContains(invocations, "Draft a pull request") || anyInvocationContains(invocations, "## What Changed") {
+		t.Fatalf("unsafe inference reached PR publication:\n%s", dumpPrompts(invocations))
+	}
+	step, ok := findStep(run.Steps, types.StepIntent)
+	if !ok || step.FindingsJSON == nil {
+		t.Fatalf("parked intent step has no findings: %+v", step)
+	}
+	findings, err := types.ParseFindingsJSON(*step.FindingsJSON)
+	if err != nil {
+		t.Fatalf("parse findings: %v", err)
+	}
+	if len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser {
+		t.Fatalf("findings = %+v, want one ask-user item", findings.Items)
+	}
+}
+
 func canonicalForCompare(t *testing.T, p string) string {
 	t.Helper()
 	if p == "" {
@@ -191,6 +281,11 @@ func readRunIntent(t *testing.T, nmHome, runID string) runIntentColumns {
 // touchedFile so file-overlap scoring matches whatever change we push.
 func seedClaudeTranscript(t *testing.T, homeDir, repoCWD, touchedFile string) {
 	t.Helper()
+	seedClaudeTranscriptWithText(t, homeDir, repoCWD, touchedFile, "please add a Bar() helper to "+touchedFile)
+}
+
+func seedClaudeTranscriptWithText(t *testing.T, homeDir, repoCWD, touchedFile, userText string) {
+	t.Helper()
 	encoded := testClaudeProjectDirName(repoCWD)
 	dir := filepath.Join(homeDir, ".claude", "projects", encoded)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -198,7 +293,7 @@ func seedClaudeTranscript(t *testing.T, homeDir, repoCWD, touchedFile string) {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	lines := []string{
-		`{"type":"user","cwd":` + testJSONString(t, repoCWD) + `,"timestamp":"` + now + `","uuid":"u1","sessionId":"e2e-session","message":{"role":"user","content":"please add a Bar() helper to ` + touchedFile + `"}}`,
+		`{"type":"user","cwd":` + testJSONString(t, repoCWD) + `,"timestamp":"` + now + `","uuid":"u1","sessionId":"e2e-session","message":{"role":"user","content":` + testJSONString(t, userText) + `}}`,
 		`{"type":"assistant","cwd":` + testJSONString(t, repoCWD) + `,"timestamp":"` + now + `","uuid":"u2","sessionId":"e2e-session","message":{"role":"assistant","content":[{"type":"text","text":"on it - editing ` + touchedFile + `"},{"type":"tool_use","name":"Edit","input":{"file_path":` + testJSONString(t, filepath.Join(repoCWD, touchedFile)) + `,"old_string":"x","new_string":"Bar()"}}]}}`,
 	}
 	path := filepath.Join(dir, "e2e-session.jsonl")
@@ -228,6 +323,45 @@ func testJSONString(t *testing.T, s string) string {
 //
 // Pattern matching is by substring (first match wins), so the summarizer
 // entry must come before the catch-all.
+func writeConcurrentIntentScenario(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "intent_concurrent_scenario.yaml")
+	content := `actions:
+  - match: "please add AlphaGoal"
+    text: "summarized"
+    structured:
+      summary: "user wanted AlphaGoal"
+  - match: "please add BetaGoal"
+    text: "summarized"
+    structured:
+      summary: "user wanted BetaGoal"
+  - text: "no issues found"
+    structured:
+      findings: []
+      summary: "no issues found"
+      risk_level: low
+      risk_rationale: "no risks detected in the diff"
+      risk_scope: source-or-external
+      tested:
+        - "fakeagent: simulated test run"
+      testing_summary: "simulated tests passed"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
+      artifacts: []
+      title: "feat: fakeagent change"
+      body: "## Summary\nfakeagent canned PR body"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write concurrent intent scenario: %v", err)
+	}
+	return path
+}
+
 func writeIntentScenario(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "intent_scenario.yaml")

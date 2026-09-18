@@ -1,13 +1,23 @@
 package intent
 
 import (
+	"math"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
 
-const decisiveMatchScore = 0.85
+const (
+	// decisiveMatchScore is the hard raw-overlap safety floor for automatic
+	// transcript selection. It is a conservative acceptance cutoff, not a
+	// confidence probability. A configured intent.threshold may raise this
+	// floor but cannot lower it.
+	decisiveMatchScore = 0.85
+	minWinnerMargin    = 0.10
+	// scoreEpsilon absorbs binary rounding so exact decimal boundaries such
+	// as 0.85 and a 0.10 margin still accept when the file-ratio math is exact.
+	scoreEpsilon = 1e-9
+)
 
 // Match is the chosen session along with its overlap score.
 type Match struct {
@@ -73,94 +83,154 @@ func pathMentionMatchesDiff(mention, diffFile string) bool {
 	return !strings.Contains(mention, "/") && filepath.Base(diffFile) == mention
 }
 
-// pickMatch returns the deterministic winner among accepted sessions.
-// A single decisive raw-score candidate wins before confidence ranking.
-// Otherwise, accepted candidates are ranked by confidence, with ties broken by
-// LastActivity.
-func pickMatch(sessions []*Session, diffFiles []string, threshold float64) *Match {
+// pickMatch returns the unique raw-overlap winner among sessions that pass
+// the multi-file and freshness filters and then the safety floor/margin.
+// Recency is diagnostic only: it never lifts a candidate over the floor or
+// breaks a near tie into an accepted match.
+func pickMatch(sessions []*Session, diffFiles []string, threshold float64) (*Match, error) {
 	return pickMatchWithOptions(sessions, diffFiles, matchOptions{Threshold: threshold})
 }
 
-func pickMatchWithOptions(sessions []*Session, diffFiles []string, opts matchOptions) *Match {
-	candidates := acceptedMatches(sessions, diffFiles, opts)
-	if len(candidates) == 0 {
-		return nil
+func pickMatchWithOptions(sessions []*Session, diffFiles []string, opts matchOptions) (*Match, error) {
+	if len(diffFiles) == 0 {
+		return nil, ErrNoMatch
 	}
-	return deterministicMatch(candidates)
+	distinct := distinctScoredSessions(sessions, diffFiles)
+	if len(distinct) == 0 {
+		return nil, ErrNoMatch
+	}
+
+	var relevant []*Match
+	for _, candidate := range distinct {
+		ok, reason, confidence := relevantOverlapFilters(candidate.Score, len(candidate.Overlap), len(diffFiles), candidate.Session.LastActivity, opts)
+		candidate.Confidence = confidence
+		if !ok {
+			logMatchDecision(opts, candidate, len(diffFiles), "rejected", reason)
+			continue
+		}
+		relevant = append(relevant, candidate)
+	}
+	if len(relevant) == 0 {
+		return nil, ErrNoMatch
+	}
+
+	winner := leadingByRawScore(relevant)
+	floor := effectiveAcceptanceFloor(opts.Threshold)
+	if winner.Score+scoreEpsilon < floor {
+		logMatchDecision(opts, winner, len(diffFiles), "rejected", "below_floor")
+		return nil, unsafeMatchError("best overlapping session score %.2f is below the %.2f acceptance floor", winner.Score, floor)
+	}
+
+	var runnerUp *Match
+	for _, candidate := range relevant {
+		if sameSession(candidate, winner) {
+			continue
+		}
+		if runnerUp == nil || candidate.Score > runnerUp.Score {
+			runnerUp = candidate
+		}
+	}
+	if runnerUp != nil && winner.Score-runnerUp.Score+scoreEpsilon < minWinnerMargin {
+		logMatchDecision(opts, winner, len(diffFiles), "rejected", "ambiguous")
+		logMatchDecision(opts, runnerUp, len(diffFiles), "rejected", "ambiguous")
+		return nil, unsafeMatchError("overlapping sessions are too close (winner %.2f, runner-up %.2f; need margin >= %.2f)", winner.Score, runnerUp.Score, minWinnerMargin)
+	}
+
+	for _, candidate := range relevant {
+		if sameSession(candidate, winner) {
+			logMatchDecision(opts, candidate, len(diffFiles), "accepted", "matched")
+			continue
+		}
+		logMatchDecision(opts, candidate, len(diffFiles), "rejected", "runner_up")
+	}
+	return winner, nil
 }
 
-func acceptedMatches(sessions []*Session, diffFiles []string, opts matchOptions) []*Match {
-	var candidates []*Match
+func distinctScoredSessions(sessions []*Session, diffFiles []string) []*Match {
+	best := make(map[string]*Match, len(sessions))
+	order := make([]string, 0, len(sessions))
 	for _, s := range sessions {
+		if s == nil {
+			continue
+		}
 		sc, overlap := score(s, diffFiles)
-		accepted, reason, confidence := acceptMatchCandidate(sc, len(overlap), len(diffFiles), s.LastActivity, opts)
-		if !accepted {
+		key := sessionKey(s)
+		candidate := &Match{Session: s, Score: sc, Overlap: overlap}
+		prev, ok := best[key]
+		if !ok {
+			best[key] = candidate
+			order = append(order, key)
 			continue
 		}
-		if opts.Logf != nil {
-			opts.Logf("candidate agent=%s session=%s cwd=%q score %.2f confidence %.2f overlap=%d/%d decision=accepted reason=%s",
-				s.AgentName, s.SessionID, s.CWD, sc, confidence, len(overlap), len(diffFiles), reason)
+		if candidate.Score > prev.Score || (candidate.Score == prev.Score && s.LastActivity.After(prev.Session.LastActivity)) {
+			best[key] = candidate
 		}
-		candidates = append(candidates, &Match{Session: s, Score: sc, Confidence: confidence, Overlap: overlap})
 	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].Confidence == candidates[j].Confidence {
-			return candidates[i].Session.LastActivity.After(candidates[j].Session.LastActivity)
-		}
-		return candidates[i].Confidence > candidates[j].Confidence
-	})
-	return candidates
+	out := make([]*Match, 0, len(order))
+	for _, key := range order {
+		out = append(out, best[key])
+	}
+	return out
 }
 
-func shouldDisambiguate(candidates []*Match) bool {
-	if len(candidates) < 2 {
-		return false
-	}
-	decisive := 0
+func leadingByRawScore(candidates []*Match) *Match {
+	var best *Match
 	for _, candidate := range candidates {
-		if candidate.Score >= decisiveMatchScore {
-			decisive++
+		if best == nil || candidate.Score > best.Score {
+			best = candidate
 		}
 	}
-	return decisive != 1
+	return best
 }
 
-func deterministicMatch(candidates []*Match) *Match {
-	var singleDecisive *Match
-	for _, candidate := range candidates {
-		if candidate.Score < decisiveMatchScore {
-			continue
-		}
-		if singleDecisive != nil {
-			return candidates[0]
-		}
-		singleDecisive = candidate
+func sameSession(a, b *Match) bool {
+	if a == nil || b == nil || a.Session == nil || b.Session == nil {
+		return a == b
 	}
-	if singleDecisive != nil {
-		return singleDecisive
-	}
-	return candidates[0]
+	return sessionKey(a.Session) == sessionKey(b.Session)
 }
 
-func acceptMatchCandidate(score float64, overlapCount, diffCount int, lastActivity time.Time, opts matchOptions) (bool, string, float64) {
+func sessionKey(s *Session) string {
+	if s == nil {
+		return ""
+	}
+	return s.AgentName + "\x00" + s.SessionID
+}
+
+func relevantOverlapFilters(score float64, overlapCount, diffCount int, lastActivity time.Time, opts matchOptions) (bool, string, float64) {
 	if diffCount == 0 || overlapCount == 0 {
 		return false, "no_overlap", score
 	}
-	threshold := opts.Threshold
-	if diffCount > 1 && threshold < 0.5 {
-		threshold = 0.5
-	}
 	if diffCount > 1 && overlapCount < 2 {
 		return false, "single_overlap_multi_file_diff", score
-	}
-	if score < threshold {
-		return false, "below_threshold", score
 	}
 	confidence := score + recencyBoost(opts.HeadTime, lastActivity)
 	if !opts.HeadTime.IsZero() && lastActivity.Before(opts.HeadTime.Add(-24*time.Hour)) && score < 0.8 {
 		return false, "stale_partial", confidence
 	}
-	return true, "matched", confidence
+	return true, "overlapping", confidence
+}
+
+func effectiveAcceptanceFloor(configured float64) float64 {
+	if !isFinite(configured) || configured < 0 {
+		return decisiveMatchScore
+	}
+	if configured > decisiveMatchScore {
+		return configured
+	}
+	return decisiveMatchScore
+}
+
+func isFinite(f float64) bool {
+	return !math.IsNaN(f) && !math.IsInf(f, 0)
+}
+
+func logMatchDecision(opts matchOptions, m *Match, diffCount int, decision, reason string) {
+	if opts.Logf == nil || m == nil || m.Session == nil {
+		return
+	}
+	opts.Logf("candidate agent=%s session=%s cwd=%q score %.2f confidence %.2f overlap=%d/%d decision=%s reason=%s",
+		m.Session.AgentName, m.Session.SessionID, m.Session.CWD, m.Score, m.Confidence, len(m.Overlap), diffCount, decision, reason)
 }
 
 func recencyBoost(headTime, lastActivity time.Time) float64 {
