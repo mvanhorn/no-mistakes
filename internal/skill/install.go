@@ -7,24 +7,71 @@ import (
 	"strings"
 )
 
+var (
+	claudeSkillsBase = filepath.Join(".claude", "skills")
+	agentsSkillsBase = filepath.Join(".agents", "skills")
+)
+
 // InstallBases are the user-level agent skill parent directories, relative to
 // the user's home directory, that init populates. `~/.claude/skills` is Claude
 // Code's personal-skill location (OpenCode reads it too); `~/.agents/skills`
 // is the vendor-neutral user-level convention Codex, OpenCode, Rovo Dev, and
-// Pi all read.
+// Pi all read. The slice is the default layout only: InstallUser may replace
+// the Claude entry from CLAUDE_CONFIG_DIR, but Install, Vendored, and this
+// list itself never read the environment.
 var InstallBases = []string{
-	filepath.Join(".claude", "skills"),
-	filepath.Join(".agents", "skills"),
+	claudeSkillsBase,
+	agentsSkillsBase,
 }
 
-// InstallUser installs the skill into the agent skill directories under the
-// current user's home directory. It returns the home-relative paths written.
+// InstallUser installs the skill into the agent skill directories for the
+// current user. The vendor-neutral copy always lands at
+// <home>/.agents/skills. The Claude copy lands at <home>/.claude/skills
+// unless CLAUDE_CONFIG_DIR is a nonempty value, in which case it lands at
+// <CLAUDE_CONFIG_DIR>/skills. Relative overrides are resolved against the
+// process working directory with filepath.Abs and are used literally (no
+// tilde or shell expansion); spaces are preserved. Resolution happens at
+// each call, not at package init, and does not mutate InstallBases.
+//
+// Returned paths are home-relative for the default layout, matching
+// Install(home). When the Claude destination is an override outside that
+// layout, the Claude filename is the absolute logical path so callers can
+// identify the file actually written. Errors resolving or writing the
+// override are returned without falling back to the default Claude location.
 func InstallUser() ([]string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve home directory: %w", err)
 	}
-	return Install(home)
+	claudeDir, claudeReport, err := userClaudeSkillsDest(home)
+	if err != nil {
+		return nil, err
+	}
+	return installAt([]installDest{
+		{dir: claudeDir, report: claudeReport},
+		{
+			dir:    filepath.Join(home, agentsSkillsBase),
+			report: filepath.Join(agentsSkillsBase, Name, "SKILL.md"),
+		},
+	})
+}
+
+// userClaudeSkillsDest returns the Claude skills parent directory and the
+// path InstallUser should report for SKILL.md. An unset or empty
+// CLAUDE_CONFIG_DIR keeps the default <home>/.claude/skills layout.
+func userClaudeSkillsDest(home string) (dir, report string, err error) {
+	override := os.Getenv("CLAUDE_CONFIG_DIR")
+	if override == "" {
+		dir = filepath.Join(home, claudeSkillsBase)
+		report = filepath.Join(claudeSkillsBase, Name, "SKILL.md")
+		return dir, report, nil
+	}
+	abs, err := filepath.Abs(override)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve CLAUDE_CONFIG_DIR: %w", err)
+	}
+	dir = filepath.Join(abs, "skills")
+	return dir, filepath.Join(dir, Name, "SKILL.md"), nil
 }
 
 // Install writes SKILL.md into each agent skills directory under root
@@ -33,17 +80,42 @@ func InstallUser() ([]string, error) {
 // Writing is idempotent: re-running overwrites with identical content
 // (refreshing a stale SKILL.md from an older version).
 //
+// Install is rooted in its explicit argument and does not consult
+// CLAUDE_CONFIG_DIR; that override is InstallUser's concern.
+//
 // Users may consolidate the two bases with a symlink - `.claude/skills` ->
 // `.agents/skills`, the whole `.claude` dir -> `.agents`, or the reverse. Install
 // follows such links transparently, including when the symlinked target dir does
 // not exist yet (a plain os.MkdirAll would fail with "file exists" on a dangling
 // symlink). Both logical bases stay readable afterward via the link.
 func Install(root string) ([]string, error) {
-	content := []byte(Markdown())
-	written := make([]string, 0, len(InstallBases))
+	dests := make([]installDest, 0, len(InstallBases))
 	for _, base := range InstallBases {
-		rel := filepath.Join(base, Name, "SKILL.md")
-		path := filepath.Join(root, rel)
+		dests = append(dests, installDest{
+			dir:    filepath.Join(root, base),
+			report: filepath.Join(base, Name, "SKILL.md"),
+		})
+	}
+	return installAt(dests)
+}
+
+// installDest is one skills parent directory to populate. dir is the
+// concrete destination (for example /home/user/.claude/skills); report is
+// the path returned to the caller and is not recomputed from the resolved
+// directory, so a logical (possibly relative) path survives symlink resolution.
+type installDest struct {
+	dir    string
+	report string
+}
+
+// installAt writes SKILL.md into each destination skills directory. Writing
+// is idempotent. On error, destinations already written are still returned
+// so callers can report partial success.
+func installAt(dests []installDest) ([]string, error) {
+	content := []byte(Markdown())
+	written := make([]string, 0, len(dests))
+	for _, dest := range dests {
+		path := filepath.Join(dest.dir, Name, "SKILL.md")
 		// Resolve any symlink components to a real directory before creating
 		// it, so a dangling symlink in the path does not collide with MkdirAll.
 		realDir, err := resolveThroughSymlinks(filepath.Dir(path))
@@ -56,7 +128,7 @@ func Install(root string) ([]string, error) {
 		if err := os.WriteFile(filepath.Join(realDir, "SKILL.md"), content, 0o644); err != nil {
 			return written, err
 		}
-		written = append(written, rel)
+		written = append(written, dest.report)
 	}
 	return written, nil
 }
