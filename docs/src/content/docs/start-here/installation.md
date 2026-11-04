@@ -23,6 +23,8 @@ irm https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.
 
 Installs the binary and restarts the background daemon automatically with `no-mistakes.exe daemon restart`, preferring a managed Task Scheduler task and falling back to a detached daemon if needed. If the restart fails, the install command fails.
 
+Run `no-mistakes` from a terminal. On Windows 11 24H2, Windows Server 2025, and later, `no-mistakes.exe` only uses a console it can share with whatever started it, which is what keeps the [background daemon](/no-mistakes/concepts/daemon/) from opening a window. It also means that double-clicking `no-mistakes.exe`, or starting it with `Start-Process` without `-NoNewWindow`, runs it without a window, so you see none of its output.
+
 Official release binaries installed this way include the default self-hosted telemetry host and website ID. Disable telemetry with `NO_MISTAKES_TELEMETRY=0`, or override the host and website ID with `NO_MISTAKES_UMAMI_HOST` and `NO_MISTAKES_UMAMI_WEBSITE_ID`.
 
 ## Go install
@@ -126,8 +128,7 @@ A [Nix install](#nix) upgrades through Nix instead.
 no-mistakes eject
 ```
 
-Removes the `no-mistakes` remote, deletes the bare repo, cleans up worktrees, and removes the database record.
-It does not remove repo-local agent skill files created by `no-mistakes init`.
+Removes the gate from the current repository; [`no-mistakes eject`](/no-mistakes/reference/cli/#no-mistakes-eject) lists exactly what it removes and what it leaves in place.
 
 ## Uninstall
 

@@ -149,7 +149,11 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			forkRepo = github.RepoSlug(sctx.Repo.ForkURL)
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitHub.DraftPullRequests
-		return github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft), ""
+		gh := github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft)
+		if sctx.Config != nil {
+			gh.WithRequiredReviews(sctx.Config.CI.RequiredReviews, sctx.Config.CI.RequiredReviewAppID)
+		}
+		return gh, ""
 	case scm.ProviderGitLab:
 		if sctx.Repo.ForkURL != "" {
 			// Fork MR routing for GitLab is intentionally not half-wired.
@@ -158,13 +162,17 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			return nil, "fork PR routing for GitLab is not implemented"
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitLab.DraftPullRequests
-		return gitlab.NewWithDraft(
+		host := gitlab.NewWithDraft(
 			cmdFactory,
 			func() bool { return stepCLIAvailable(sctx, provider) },
 			resolvedHost(sctx, sctx.Repo.UpstreamURL),
 			gitlab.ProjectPath(sctx.Repo.UpstreamURL),
 			draft,
-		), ""
+		)
+		if sctx.Config != nil {
+			host.WithRequiredReviews(sctx.Config.CI.RequiredReviews, sctx.Config.CI.RequiredReviewBotID)
+		}
+		return host, ""
 	case scm.ProviderBitbucket:
 		if sctx.Repo.ForkURL != "" {
 			// Fork PR routing for Bitbucket is intentionally not half-wired.

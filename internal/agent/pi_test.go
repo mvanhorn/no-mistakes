@@ -417,13 +417,13 @@ func TestPiAgent_SchemaRejectedOutputStillReportsUsage(t *testing.T) {
 func TestPiAgent_ExitFailureStillReportsParsedUsage(t *testing.T) {
 	bin := writeFakePi(t, t.TempDir(), `#!/bin/sh
 cat > /dev/null
-printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"ok\":true}"}],"usage":{"input":11,"output":7,"cacheRead":9,"cacheWrite":2}}}'
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","model":"reported-model","provider":"reported-provider","content":[{"type":"text","text":"{\"ok\":true}"}],"usage":{"input":11,"output":7,"cacheRead":9,"cacheWrite":2}}}'
 printf '%s\n' '{"type":"agent_end","messages":[]}'
 exit 1
 `, strings.Join([]string{
 		"@echo off",
 		"more > nul",
-		"echo {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"ok\\\":true}\"}],\"usage\":{\"input\":11,\"output\":7,\"cacheRead\":9,\"cacheWrite\":2}}}",
+		"echo {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"reported-model\",\"provider\":\"reported-provider\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"ok\\\":true}\"}],\"usage\":{\"input\":11,\"output\":7,\"cacheRead\":9,\"cacheWrite\":2}}}",
 		"echo {\"type\":\"agent_end\",\"messages\":[]}",
 		"exit /b 1",
 	}, "\r\n"))
@@ -437,6 +437,9 @@ exit 1
 	}
 	if result == nil {
 		t.Fatal("exit failure must still return parsed usage")
+	}
+	if result.Model != "reported-model" || result.ModelProvider != "reported-provider" {
+		t.Fatalf("exit failure lost served identity: %+v", result)
 	}
 	if result.Usage.InputTokens != 22 || result.Usage.OutputTokens != 7 ||
 		result.Usage.CacheReadTokens != 9 || !result.UsageReported {
@@ -597,23 +600,93 @@ func TestPiAgent_RunRejectsEmptyOutput(t *testing.T) {
 	dir := t.TempDir()
 	bin := writeFakePi(t, dir, `#!/bin/sh
 cat > /dev/null
-printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"   "}]}}'
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","model":"reported-model","provider":"reported-provider","content":[{"type":"text","text":"   "}]}}'
 `, strings.Join([]string{
 		"@echo off",
 		"more > nul",
-		"echo {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"   \"}]}}",
+		"echo {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"reported-model\",\"provider\":\"reported-provider\",\"content\":[{\"type\":\"text\",\"text\":\"   \"}]}}",
 	}, "\r\n"))
 
 	pa := &piAgent{bin: bin}
-	_, err := pa.Run(context.Background(), RunOpts{
+	result, err := pa.Run(context.Background(), RunOpts{
 		Prompt: "review",
 		CWD:    t.TempDir(),
 	})
 	if err == nil {
 		t.Fatal("expected error")
 	}
+	if result == nil || result.Model != "reported-model" || result.ModelProvider != "reported-provider" {
+		t.Fatalf("empty output lost served identity: %+v", result)
+	}
 	if !strings.Contains(err.Error(), "no text output") {
 		t.Errorf("expected 'no text output', got: %v", err)
+	}
+}
+
+func TestPiAgent_RunRetriesRealFetchFailure(t *testing.T) {
+	previous := transientBackoff
+	transientBackoff = func(ctx context.Context, _ int) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	t.Cleanup(func() { transientBackoff = previous })
+
+	cwd := t.TempDir()
+	bin := writeFakePi(t, t.TempDir(), `#!/bin/sh
+set -eu
+cat > /dev/null
+printf '%s\n' attempt >> pi-attempts.txt
+if [ ! -f pi-first-attempt ]; then
+	: > pi-first-attempt
+	printf '%s\n' 'fetch failed' >&2
+	exit 1
+fi
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}'
+`, strings.Join([]string{
+		"@echo off",
+		"more > nul",
+		"echo attempt>> pi-attempts.txt",
+		"if exist pi-first-attempt goto success",
+		"echo.> pi-first-attempt",
+		"echo fetch failed 1>&2",
+		"exit /b 1",
+		":success",
+		"echo {\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}]}",
+	}, "\r\n"))
+
+	var attempts []Attempt
+	result, err := (&piAgent{bin: bin}).Run(context.Background(), RunOpts{
+		Prompt: "review",
+		CWD:    cwd,
+		OnAttempt: func(attempt Attempt) {
+			attempts = append(attempts, attempt)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result == nil || result.Text != "ok" {
+		t.Fatalf("result = %+v, want successful second invocation", result)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("attempts = %d, want first failure and second success", len(attempts))
+	}
+	if attempts[0].Err == nil || !strings.Contains(attempts[0].Err.Error(), "pi exited: ") || !strings.Contains(attempts[0].Err.Error(), "fetch failed") {
+		t.Fatalf("first attempt error = %v, want Pi's wrapped fetch failure", attempts[0].Err)
+	}
+	if attempts[1].Err != nil {
+		t.Fatalf("second attempt error = %v", attempts[1].Err)
+	}
+	data, err := os.ReadFile(filepath.Join(cwd, "pi-attempts.txt"))
+	if err != nil {
+		t.Fatalf("read attempt marker: %v", err)
+	}
+	if got := len(strings.Fields(string(data))); got != 2 {
+		t.Fatalf("Pi invocations = %d, want 2", got)
 	}
 }
 

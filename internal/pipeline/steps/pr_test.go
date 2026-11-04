@@ -82,11 +82,11 @@ func TestPRStep_UpdatesExistingPR(t *testing.T) {
 		t.Fatal(err)
 	}
 	ghLog := string(logData)
-	if !strings.Contains(ghLog, "pr edit") {
-		t.Errorf("expected gh pr edit to be called, got:\n%s", ghLog)
+	if !strings.Contains(ghLog, "--method PATCH") {
+		t.Errorf("expected gh api PATCH to be called, got:\n%s", ghLog)
 	}
 	if !strings.Contains(ghLog, "--body") {
-		t.Errorf("expected --body flag in gh pr edit, got:\n%s", ghLog)
+		t.Errorf("expected the PR body in the gh api PATCH, got:\n%s", ghLog)
 	}
 	if !strings.Contains(ghLog, noMistakesPRSignature) {
 		t.Errorf("expected updated PR body to include no-mistakes signature, got:\n%s", ghLog)
@@ -128,7 +128,7 @@ func TestPRStep_MalformedPRListFailsClosed(t *testing.T) {
 	if !strings.Contains(ghLog, "pr list --head feature ") || !strings.Contains(ghLog, "--state open --json number,url,baseRefName") {
 		t.Fatalf("expected production PR lookup command, got:\n%s", ghLog)
 	}
-	if strings.Contains(ghLog, "pr create") || strings.Contains(ghLog, "pr edit") {
+	if strings.Contains(ghLog, "pr create") || strings.Contains(ghLog, "--method PATCH") {
 		t.Fatalf("malformed lookup must stop before PR mutation, got:\n%s", ghLog)
 	}
 
@@ -175,7 +175,7 @@ func TestPRStep_UsesResolvedForgeProviderForSelfHostedRemote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(logData), "pr edit") {
+	if !strings.Contains(string(logData), "--method PATCH") {
 		t.Fatalf("expected gh to update the existing PR, got:\n%s", logData)
 	}
 	if !strings.Contains(string(logData), "auth status --hostname code.example.test") {
@@ -676,8 +676,8 @@ func TestPRStep_ExistingPRAgainstDifferentBaseIsUpdatedNotDuplicated(t *testing.
 	if strings.Contains(ghLog, "pr create") {
 		t.Fatalf("expected existing PR to be updated, not duplicated with a new pr create, got:\n%s", ghLog)
 	}
-	if !strings.Contains(ghLog, "pr edit") {
-		t.Fatalf("expected gh pr edit to update the existing PR, got:\n%s", ghLog)
+	if !strings.Contains(ghLog, "--method PATCH") {
+		t.Fatalf("expected gh api PATCH to update the existing PR, got:\n%s", ghLog)
 	}
 
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
@@ -2007,7 +2007,7 @@ func TestFallbackPRContentCapsBodyAfterPrependedIntent(t *testing.T) {
 		rounds = append(rounds, fmt.Sprintf("review round %03d - %s", i, strings.Repeat("x", 700)))
 	}
 
-	content, err := fallbackPRContent(
+	content, err := (&PRStep{}).fallbackPRContent(
 		sctx,
 		"A\tinternal/pipeline/steps/pr.go",
 		"✅ Low: generated PR body length guard only",
@@ -2265,11 +2265,12 @@ func TestPRStep_PromptUsesWhatChanged(t *testing.T) {
 
 	env, _ := fakeGH(t, "")
 
-	var capturedPrompt string
+	var capturedPrompt, capturedSchema string
 	ag := &mockAgent{
 		name: "test",
 		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
 			capturedPrompt = opts.Prompt
+			capturedSchema = string(opts.JSONSchema)
 			payload := json.RawMessage(`{"title":"feat: add bar","body":"## What Changed\n\n- add Bar()"}`)
 			return &agent.Result{Output: payload}, nil
 		},
@@ -2284,6 +2285,15 @@ func TestPRStep_PromptUsesWhatChanged(t *testing.T) {
 
 	if !strings.Contains(capturedPrompt, "## What Changed") {
 		t.Errorf("expected prompt to instruct agent to write ## What Changed, got:\n%s", capturedPrompt)
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(capturedSchema), &schema); err != nil {
+		t.Fatalf("unparseable PR output schema: %v", err)
+	}
+	if _, ok := schema.Properties["intent_brief"]; ok {
+		t.Errorf("default raw mode changed the PR output schema: %s", capturedSchema)
 	}
 }
 
@@ -2872,7 +2882,7 @@ func TestFallbackPRBodyAttestationDoesNotShadowTheRealOne(t *testing.T) {
 		pipelineAttestationCommentClosingToken
 
 	pipelineMD, riskLine, testingMD := (&PRStep{}).buildPipelineSection(sctx, scm.ProviderGitHub)
-	content, err := fallbackPRContent(sctx, "A\t"+embedded, riskLine, testingMD, pipelineMD, 0, scm.ProviderGitHub)
+	content, err := (&PRStep{}).fallbackPRContent(sctx, "A\t"+embedded, riskLine, testingMD, pipelineMD, 0, scm.ProviderGitHub)
 	if err != nil {
 		t.Fatal(err)
 	}

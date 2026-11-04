@@ -105,6 +105,9 @@ func (m Model) maybeAutoApproveCmd() tea.Cmd {
 	if step == nil || m.yoloApproved[step.StepName] {
 		return nil
 	}
+	if pipeline.HasReviewFixRoundLimit(m.stepFindings[step.StepName]) {
+		return nil
+	}
 	if pipeline.HasProtectedPathRefusal(m.stepFindings[step.StepName]) || pipeline.HasUnvalidatedWorkRefusal(m.stepFindings[step.StepName]) {
 		return nil
 	}
@@ -156,6 +159,7 @@ func (m Model) respondCmd(action types.ApprovalAction) tea.Cmd {
 	}
 	return func() tea.Msg {
 		params := &ipc.RespondParams{
+			Origin: types.ResponseOriginInteractive,
 			RunID:  m.runID,
 			Step:   step.StepName,
 			Action: action,

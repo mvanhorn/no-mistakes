@@ -203,9 +203,11 @@ func newPipelineAttestation(steps []*db.StepResult, rounds map[string][]*db.Step
 			Status: sr.Status,
 		}
 		if sr.StepName == types.StepTest && sr.OverrideReason != nil {
-			item.OverrideReason = strings.TrimSpace(*sr.OverrideReason)
+			// Free text: JSON would write a control byte as \u00XX, which the
+			// publication boundary rewrites into a form that is not valid JSON.
+			item.OverrideReason = neutralizePRControls(strings.TrimSpace(*sr.OverrideReason))
 			if item.OverrideReason != "" {
-				attestation.AllowTestCommandOverride = strings.TrimSpace(policy.AllowTestCommandOverride)
+				attestation.AllowTestCommandOverride = neutralizePRControls(strings.TrimSpace(policy.AllowTestCommandOverride))
 			}
 		}
 		attestation.Steps = append(attestation.Steps, item)
@@ -347,15 +349,16 @@ func BuildTestingSummaryForPR(steps []*db.StepResult, rounds map[string][]*db.St
 }
 
 func BuildTestingSummaryForPRWithProvider(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider) string {
-	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil)
+	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil, true)
 }
 
-func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string) string {
+func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact bool) string {
 	opts := testingSummaryOptionsForGitHub(upstreamURL, ref)
 	opts.flavor = prBodyFlavorFor(provider)
-	opts.compactArtifacts = true
-	opts.summaryParagraph = true
-	opts.omitOutcome = true
+	opts.compactArtifacts = compact
+	opts.summaryParagraph = compact
+	opts.omitOutcome = compact
+	opts.includeTestedDetails = !compact
 	opts.repoRoot = repoRoot
 	opts.evidenceRoot = evidenceRoot
 	opts.evidence = links
@@ -429,10 +432,9 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 			if rendered == "" {
 				continue
 			}
-			// A compact block with an uploaded attachment always starts with
-			// it. GitHub plays a bare video URL inline only when the URL is a
-			// paragraph by itself, so the block gets a blank line on both sides.
-			attachment := opts.compactArtifacts && opts.attachmentURL(artifact) != ""
+			// GitHub plays a bare uploaded video URL inline only when it is
+			// a paragraph by itself, so attachment blocks get blank lines.
+			attachment := opts.attachmentURL(artifact) != ""
 			if needsArtifactBlockSeparator(previousArtifact, rendered) {
 				b.WriteString("\n")
 			} else if (attachment || previousAttachment) && !strings.HasSuffix(b.String(), "\n\n") {
@@ -701,15 +703,30 @@ func renderTestingArtifact(artifact types.TestArtifact, opts testingSummaryOptio
 	}
 
 	var b strings.Builder
-	if target != "" && isImageArtifact(artifact.Kind, target) {
+	// Keep an inspectable source before any preview, which may be truncated.
+	link := artifact.URL
+	if link == "" {
+		link = artifactLinkTargetForPath(artifact, opts)
+	}
+	if link == "" {
+		link = opts.attachmentURL(artifact)
+	}
+	if link != "" {
+		b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n\n", html.EscapeString(label), link))
+	}
+	if attachment := opts.attachmentURL(artifact); attachment != "" {
+		b.WriteString(renderAttachmentMarkdown(artifact, attachment, label))
+	} else if target != "" && isImageArtifact(artifact.Kind, target) {
 		b.WriteString(fmt.Sprintf("**%s**\n\n![%s](%s)\n", html.EscapeString(label), markdownAltText(label), target))
 	} else if target != "" && isVideoArtifact(artifact.Kind, target) {
 		if opts.flavor == prBodyMarkdown {
-			b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n", html.EscapeString(label), target))
+			if link == "" {
+				b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n", html.EscapeString(label), target))
+			}
 		} else {
 			b.WriteString(fmt.Sprintf("**%s**\n\n<video src=\"%s\" controls></video>\n", html.EscapeString(label), html.EscapeString(target)))
 		}
-	} else if !hasFile {
+	} else if !hasFile && link == "" {
 		if target != "" {
 			b.WriteString(fmt.Sprintf("- Evidence: [%s](%s)\n", html.EscapeString(label), target))
 		} else if localPath != "" {
@@ -863,7 +880,7 @@ func readEmbeddedArtifactText(fsPath string) (string, error) {
 		if err != nil || !looksLikeTextArtifact(data) {
 			return "", err
 		}
-		return string(data), nil
+		return neutralizePRControls(string(data)), nil
 	}
 
 	file, err := os.Open(fsPath)
@@ -888,7 +905,7 @@ func readEmbeddedArtifactText(fsPath string) (string, error) {
 		return "", nil
 	}
 	omitted := info.Size() - int64(len(head)+len(tail))
-	return string(head) + fmt.Sprintf("\n\n... [%d bytes truncated] ...\n\n", omitted) + string(tail), nil
+	return neutralizePRControls(string(head) + fmt.Sprintf("\n\n... [%d bytes truncated] ...\n\n", omitted) + string(tail)), nil
 }
 
 func looksLikeTextArtifact(data []byte) bool {
@@ -1648,7 +1665,12 @@ func escapePipelineFoldMarkers(s string) string {
 // (closingGrammarFor), since every PR-body site that generates text passes
 // through here - the grammar has to travel with the text, because GitLab
 // resolves a reference inside a code block where GitHub does not.
+//
+// Control characters are cleaned first: the publication boundary strips them
+// again, and a terminal escape hidden inside a marker or closing keyword would
+// otherwise hide it from these escapes and become live once it is removed.
 func neutralizeAttestationMarkers(provider scm.Provider, s string) string {
+	s = neutralizePRControls(s)
 	escaped := escapePRAppendixMarkers(strings.ReplaceAll(s, pipelineAttestationCommentPrefix, escapedPipelineAttestationCommentPrefix))
 	return closingGrammarFor(provider).neutralize(escaped)
 }

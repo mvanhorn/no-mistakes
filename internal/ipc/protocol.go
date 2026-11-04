@@ -17,6 +17,7 @@ const (
 	MethodPushReceived              = "push_received"
 	MethodResolvePiProfile          = "resolve_pi_profile"
 	MethodProbeOmitIntent           = "probe_omit_intent"
+	MethodProbeRunPRText            = "probe_run_pr_text"
 	MethodReleaseVerificationPlan   = "release_verification_plan"
 	MethodCaptureVerificationPlan   = "capture_verification_plan"
 	MethodStartFreshRun             = "start_fresh_run"
@@ -27,10 +28,12 @@ const (
 	MethodGetRunsForHead            = "get_runs_for_head"
 	MethodGetActiveRun              = "get_active_run"
 	MethodRerun                     = "rerun"
+	MethodRetryRun                  = "retry_run"
 	MethodSubscribe                 = "subscribe"
 	MethodRespond                   = "respond"
 	MethodAnswerReview              = "answer_review_question"
 	MethodCancelRun                 = "cancel_run"
+	MethodHandoffRun                = "handoff_run"
 	MethodGateContext               = "gate_context"
 	MethodAdmitPush                 = "admit_push"
 	MethodHealth                    = "health"
@@ -49,10 +52,11 @@ const (
 
 // Request is a JSON-RPC 2.0 request.
 type Request struct {
-	JSONRPC string          `json:"jsonrpc"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	ID      int64           `json:"id"`
+	JSONRPC          string          `json:"jsonrpc"`
+	Method           string          `json:"method"`
+	Params           json.RawMessage `json:"params,omitempty"`
+	ID               int64           `json:"id"`
+	DeadlineUnixNano int64           `json:"deadline_unix_nano,omitempty"`
 }
 
 // Response is a JSON-RPC 2.0 response.
@@ -104,6 +108,11 @@ type PushReceivedParams struct {
 	// ClosingIssueRefs are the explicit issues (axi run --closes) the
 	// generated PR should close.
 	ClosingIssueRefs []string `json:"closing_issue_refs,omitempty"`
+	// PRTitle and PRBody are the caller-supplied PR title and description
+	// (axi run --pr-title / --pr-body-file), used only when the run creates
+	// the PR.
+	PRTitle string `json:"pr_title,omitempty"`
+	PRBody  string `json:"pr_body,omitempty"`
 }
 
 // StartFreshRunParams requests a nonce-bound fresh launch for one exact gate
@@ -123,6 +132,8 @@ type StartFreshRunParams struct {
 	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
 	OmitIntent           bool             `json:"omit_intent,omitempty"`
 	ClosingIssueRefs     []string         `json:"closing_issue_refs,omitempty"`
+	PRTitle              string           `json:"pr_title,omitempty"`
+	PRBody               string           `json:"pr_body,omitempty"`
 }
 
 // CaptureVerificationPlanParams requests a snapshot before the caller pushes.
@@ -155,6 +166,17 @@ type ProbeOmitIntentResult struct {
 	OK bool `json:"ok"`
 }
 
+// ProbeRunPRTextParams is the empty request for MethodProbeRunPRText.
+type ProbeRunPRTextParams struct{}
+
+// ProbeRunPRTextResult answers MethodProbeRunPRText, the capability check for
+// pr_title and pr_body. An older daemon would drop those unknown fields and
+// open a PR with drafted text instead; it refuses the unknown method, so a
+// client that reaches OK=true knows the supplied text is honored.
+type ProbeRunPRTextResult struct {
+	OK bool `json:"ok"`
+}
+
 // ClaimLaunchReceiptParams identifies one exact opaque receipt binding.
 // Generic run/status surfaces never expose launch bindings or intent digests.
 type ClaimLaunchReceiptParams struct {
@@ -168,6 +190,9 @@ type ClaimLaunchReceiptParams struct {
 	IntentDigest         string `json:"intent_digest"`
 	PRBaseBranch         string `json:"pr_base_branch,omitempty"`
 	OmitIntent           bool   `json:"omit_intent,omitempty"`
+	// PRTextDigest is db.PRTextDigest of the supplied PR title and
+	// description, "" for none. A replay must match the run's stored text.
+	PRTextDigest string `json:"pr_text_digest,omitempty"`
 }
 
 // GetRunParams requests a single run by ID.
@@ -240,6 +265,30 @@ type RerunParams struct {
 	// ClosingIssueRefs are added to the references the selected run carried;
 	// a rerun never drops an inherited closing reference.
 	ClosingIssueRefs []string `json:"closing_issue_refs,omitempty"`
+	// PRTitle and PRBody each replace the selected run's supplied value when
+	// set; an unset field inherits it.
+	PRTitle string `json:"pr_title,omitempty"`
+	PRBody  string `json:"pr_body,omitempty"`
+}
+
+// RetryRunParams asks the daemon to continue a failed run from its failed
+// step. RunID must name the branch's latest run: it confirms the run the
+// caller inspected and never selects any other. CallerHeadSHA is the clean
+// caller worktree's HEAD; empty means the worktree was not clean.
+type RetryRunParams struct {
+	RepoID        string `json:"repo_id"`
+	Branch        string `json:"branch"`
+	RunID         string `json:"run_id"`
+	CallerHeadSHA string `json:"caller_head_sha,omitempty"`
+}
+
+// RetryRunResult names the run that continues the failed one and the step it
+// restarted, with the round of that step the failed run was in.
+type RetryRunResult struct {
+	RunID       string         `json:"run_id"`
+	SourceRunID string         `json:"source_run_id"`
+	Step        types.StepName `json:"step"`
+	SourceRound int            `json:"source_round"`
 }
 
 // SubscribeParams starts an event stream for a run.
@@ -247,7 +296,7 @@ type SubscribeParams struct {
 	RunID string `json:"run_id"`
 }
 
-// RespondParams sends a user action for a step awaiting approval.
+// RespondParams sends a gate action for a step awaiting approval.
 //
 // Instructions carries optional per-finding notes keyed by finding ID, which
 // the daemon attaches to the corresponding finding before dispatching a fix.
@@ -261,14 +310,25 @@ type SubscribeParams struct {
 // already decided it, and the daemon refuses the response (leaving the gate
 // parked) when one is left out. An omission is never a decline.
 type RespondParams struct {
+	Origin           types.ResponseOrigin `json:"origin,omitempty"`
+	Coverage         *CoverageBinding     `json:"coverage,omitempty"`
 	RunID            string               `json:"run_id"`
 	Step             types.StepName       `json:"step"`
 	Action           types.ApprovalAction `json:"action"`
 	FindingIDs       []string             `json:"finding_ids,omitempty"`
 	IgnoreFindingIDs []string             `json:"ignore_finding_ids,omitempty"`
 	Instructions     map[string]string    `json:"instructions,omitempty"`
-	AddedFindings    []types.Finding      `json:"added_findings,omitempty"`
-	ApprovalReason   string               `json:"approval_reason,omitempty"` // Test approval only
+	// InstructionsFromDriver marks Instructions as an agent driver's fix
+	// guidance rather than the user's own words.
+	InstructionsFromDriver bool            `json:"instructions_from_driver,omitempty"`
+	AddedFindings          []types.Finding `json:"added_findings,omitempty"`
+	ApprovalReason         string          `json:"approval_reason,omitempty"` // Test approval, or the reason recorded with an abort
+}
+
+type CoverageBinding struct {
+	HeadSHA      string `json:"head_sha"`
+	StepResultID string `json:"step_result_id"`
+	RoundID      string `json:"round_id"`
 }
 
 // CancelRunParams cancels an active pipeline run.
@@ -488,6 +548,15 @@ type RunInfo struct {
 	// tighten-only request to keep the generated Intent section out of the
 	// PR body (see runs.omit_intent).
 	OmitIntent bool `json:"omit_intent,omitempty"`
+	// PRTitleDigest and PRBodyDigest identify the run's caller-supplied PR
+	// title and description (db.PRTextDigest of each alone), so a reattach can
+	// refuse different text without the text riding every run listing.
+	PRTitleDigest string `json:"pr_title_digest,omitempty"`
+	PRBodyDigest  string `json:"pr_body_digest,omitempty"`
+	// QuotaRouting is the run's quota-aware agent-ordering record (the raw
+	// quotarouting.Record JSON) when the feature is on for this run, empty
+	// otherwise. Local-only observability; see internal/quotarouting.
+	QuotaRouting string `json:"quota_routing,omitempty"`
 	// AwaitingAgent is true while the run is parked at a gate awaiting the
 	// driving agent's response. AwaitingAgentSince is the unix-seconds time it
 	// parked, so a supervisor can read "parked for N seconds" in one call. Both
@@ -501,6 +570,10 @@ type RunInfo struct {
 	// axi's outcome wording does not need to inspect every step itself.
 	CIOverrideReason   string `json:"ci_override_reason,omitempty"`
 	TestOverrideReason string `json:"test_override_reason,omitempty"`
+	// RetryOf links a run started by axi retry to the failed run it continues;
+	// RetriedBy names the run that continued this failed run.
+	RetryOf   *RunRetryInfo `json:"retry_of,omitempty"`
+	RetriedBy string        `json:"retried_by,omitempty"`
 	// StateRev is the monotonic run-state revision this snapshot is at least
 	// as new as. It is sampled before the database read, so every event at or
 	// below it is already reflected here and every event above it still
@@ -510,19 +583,31 @@ type RunInfo struct {
 	UpdatedAt int64 `json:"updated_at"`
 }
 
+// RunRetryInfo is the audit link from a continuation run to the failure it
+// continues: the failed run, its failed step and round, that step's error,
+// and the preserved head the continuation started from.
+type RunRetryInfo struct {
+	RunID             string         `json:"run_id"`
+	Step              types.StepName `json:"step"`
+	Round             int            `json:"round"`
+	Error             string         `json:"error"`
+	CheckpointHeadSHA string         `json:"checkpoint_head_sha"`
+}
+
 // WorkScopeDocumentLintHousekeeping identifies the one agent invocation that
 // performs both duties while its wall time is stored on the document step.
 const WorkScopeDocumentLintHousekeeping = "document+lint housekeeping"
 
 // StepResultInfo is the IPC representation of a step result.
 type StepResultInfo struct {
-	ID         string           `json:"id"`
-	RunID      string           `json:"run_id"`
-	StepName   types.StepName   `json:"step_name"`
-	StepOrder  int              `json:"step_order"`
-	Status     types.StepStatus `json:"status"`
-	ExitCode   *int             `json:"exit_code,omitempty"`
-	DurationMS *int64           `json:"duration_ms,omitempty"`
+	LatestRoundID string           `json:"latest_round_id,omitempty"`
+	ID            string           `json:"id"`
+	RunID         string           `json:"run_id"`
+	StepName      types.StepName   `json:"step_name"`
+	StepOrder     int              `json:"step_order"`
+	Status        types.StepStatus `json:"status"`
+	ExitCode      *int             `json:"exit_code,omitempty"`
+	DurationMS    *int64           `json:"duration_ms,omitempty"`
 	// WorkScope names shared work whose wall time is recorded on this logical
 	// step. For example, the document step can own one combined document+lint
 	// housekeeping invocation while lint only records the cached handoff.
