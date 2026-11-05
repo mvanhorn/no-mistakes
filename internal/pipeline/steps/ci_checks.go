@@ -494,8 +494,6 @@ func ciMonitoringTimeoutOutcome() *pipeline.StepOutcome {
 	}
 }
 
-// pendingObservations belongs to one Execute invocation. Missing, ambiguous, or
-// unavailable evidence never supplies idle credit to a later observation.
 // A negative window disables the stall park.
 func pendingCheckIdleWindow(cfg *config.Config) time.Duration {
 	if cfg == nil || cfg.CIStallTimeout == 0 {
@@ -509,6 +507,8 @@ type pendingObservation struct {
 	since time.Time
 }
 
+// pendingObservations belongs to one Execute invocation. Missing, ambiguous, or
+// unavailable evidence never supplies idle credit to a later observation.
 type pendingObservations struct {
 	window time.Duration
 	head   string
